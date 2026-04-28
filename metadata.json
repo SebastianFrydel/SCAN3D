@@ -1,0 +1,10 @@
+{
+  "name": "RoomScanner 3D",
+  "description": "Scan your room using your camera and device sensors, analyze dimensions with Gemini, and generate 3D models and interior design concepts.",
+  "requestFramePermissions": [
+    "camera",
+    "gyroscope",
+    "accelerometer",
+    "xr-spatial-tracking"
+  ]
+}
