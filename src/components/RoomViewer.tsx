@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Grid, Environment } from '@react-three/drei';
 import * as THREE from 'three';
@@ -79,8 +79,8 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
         return { ...plane, matrix, globalPoints, minY, maxY };
     });
 
-    const horizontalPlanes = globalPlanes.filter(p => p.orientation === 'horizontal');
-    const verticalPlanes = globalPlanes.filter(p => p.orientation === 'vertical');
+    const horizontalPlanes = globalPlanes.filter(p => p.orientation?.toLowerCase() === 'horizontal');
+    const verticalPlanes = globalPlanes.filter(p => p.orientation?.toLowerCase() === 'vertical');
 
     let fY = 0;
     let cY = 2.5;
@@ -206,6 +206,15 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
     });
   }, [planes]);
 
+
+  useEffect(() => {
+    return () => {
+      floorHull.dispose();
+      ceilingHull.dispose();
+      rawPlaneMeshes.forEach((pm) => pm.geometry.dispose());
+    };
+  }, [floorHull, ceilingHull, rawPlaneMeshes]);
+
   const handleApplyMaterial = (matType: MaterialType) => {
       if (selectedMeshId) {
           setCustomMaterials(prev => ({
@@ -284,7 +293,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
              // setSelectedMeshId(null);
           }
       }}>
-        <Canvas camera={{ position: [roomCenter[0], (ceilingY - floorY) * 1.5 || 3, roomCenter[2] + 4], fov: 100 }}>
+        <Canvas dpr={[1.5, 2.5]} gl={{ antialias: true, powerPreference: 'high-performance' }} camera={{ position: [roomCenter[0], (ceilingY - floorY) * 1.5 || 3, roomCenter[2] + 4], fov: 100 }}>
           <color attach="background" args={['#0f172a']} />
           <ambientLight intensity={0.5} />
           <directionalLight position={[10, 15, 10]} intensity={1.5} color="#ffffff" castShadow />
