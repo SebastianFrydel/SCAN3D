@@ -30,8 +30,9 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     scene.add(light);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
     renderer.xr.enabled = true;
     container.appendChild(renderer.domElement);
 
@@ -54,7 +55,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     const onWindowResize = () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
     };
     window.addEventListener('resize', onWindowResize);
 
