@@ -18,6 +18,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
   const containerRef = useRef<HTMLDivElement>(null);
   const [activePlanesCount, setActivePlanesCount] = useState(0);
   const planesDataRef = useRef<Map<any, ScannedPlane>>(new Map());
+  const startRequestedRef = useRef(false);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -37,16 +38,23 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     container.appendChild(renderer.domElement);
 
     const overlayDiv = document.getElementById('ar-overlay');
-    const arButton = ARButton.createButton(renderer, {
+    const arButtonOptions: any = {
       requiredFeatures: ['plane-detection'],
-      optionalFeatures: ['dom-overlay'],
-      // @ts-ignore
-      domOverlay: { root: overlayDiv }
-    });
+      optionalFeatures: overlayDiv ? ['dom-overlay'] : []
+    };
+    if (overlayDiv) arButtonOptions.domOverlay = { root: overlayDiv };
+    const arButton = ARButton.createButton(renderer, arButtonOptions);
     
     arButton.style.display = 'none';
     container.appendChild(arButton);
-    const clickTimeout = setTimeout(() => { arButton.click(); }, 100);
+    const clickTimeout = setTimeout(() => {
+      // Some browsers/devices reject programmatic AR starts unless done after user gesture.
+      // Fallback: let user tap again from landing screen.
+      if (!startRequestedRef.current) {
+        startRequestedRef.current = true;
+        arButton.click();
+      }
+    }, 100);
 
     const planesMap = new Map<any, THREE.Mesh>();
     let currentSession: any = null;
@@ -63,6 +71,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
       renderer.setAnimationLoop(render);
     };
 
+    const planeGeometryVersion = new Map<any, number>();
     const render = (timestamp: number, frame: any) => {
       if (frame) {
         currentSession = renderer.xr.getSession();
@@ -104,18 +113,26 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
               mesh.position.copy(pose.transform.position);
               mesh.quaternion.copy(pose.transform.orientation);
               
-              const shape = new THREE.Shape();
               const poly = [];
               for (let i = 0; i < plane.polygon.length; i++) {
                 const p = plane.polygon[i];
                 poly.push({x: p.x, y: p.y, z: p.z});
-                if (i === 0) shape.moveTo(p.x, -p.z);
-                else shape.lineTo(p.x, -p.z);
               }
-              const geom = new THREE.ShapeGeometry(shape);
-              geom.rotateX(-Math.PI / 2); // align to WebXR plane local space (Y is normal)
-              if (mesh.geometry) mesh.geometry.dispose();
-              mesh.geometry = geom;
+
+              const currentVersion = plane.lastChangedTime || timestamp;
+              if (planeGeometryVersion.get(plane) !== currentVersion) {
+                const shape = new THREE.Shape();
+                for (let i = 0; i < poly.length; i++) {
+                  const p = poly[i];
+                  if (i === 0) shape.moveTo(p.x, -p.z);
+                  else shape.lineTo(p.x, -p.z);
+                }
+                const geom = new THREE.ShapeGeometry(shape);
+                geom.rotateX(-Math.PI / 2); // align to WebXR plane local space (Y is normal)
+                if (mesh.geometry) mesh.geometry.dispose();
+                mesh.geometry = geom;
+                planeGeometryVersion.set(plane, currentVersion);
+              }
 
               const data = planesDataRef.current.get(plane);
               if (data) {
@@ -133,6 +150,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
               mesh.geometry?.dispose();
               (mesh.material as THREE.Material)?.dispose();
               planesMap.delete(plane);
+              planeGeometryVersion.delete(plane);
               planesDataRef.current.delete(plane);
               setActivePlanesCount(planesMap.size);
             }
