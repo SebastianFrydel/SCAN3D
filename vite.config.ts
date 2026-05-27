@@ -13,6 +13,10 @@ export default defineConfig(({mode}) => {
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src'),
+        'react': path.resolve(__dirname, 'node_modules/react'),
+        'react-dom': path.resolve(__dirname, 'node_modules/react-dom'),
+        '@react-three/fiber': path.resolve(__dirname, 'node_modules/@react-three/fiber'),
+        'three': path.resolve(__dirname, 'node_modules/three'),
       },
     },
     server: {

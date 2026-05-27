@@ -1,29 +1,71 @@
 import React, { useState, useEffect } from 'react';
 import { ARScanner, ScannedPlane } from './components/ARScanner';
+import { ScannerSimulator } from './components/ScannerSimulator';
 import { RoomViewer } from './components/RoomViewer';
 import { Button } from './components/ui/button';
-import { Box, Scan, AlertCircle } from 'lucide-react';
+import { Box, Scan, AlertCircle, Wand2 } from 'lucide-react';
 import { Toaster } from 'sonner';
+import { RoomLighting } from './core/models/types';
 
-type AppState = 'landing' | 'scanning' | 'viewing';
+type AppState = 'landing' | 'scanning' | 'simulating' | 'viewing';
 
-export default function App() {
+class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: any, errorInfo: any}> {
+  constructor(props: {children: React.ReactNode}) {
+    super(props);
+    this.state = { error: null, errorInfo: null };
+  }
+  componentDidCatch(error: any, errorInfo: any) {
+    this.setState({ error, errorInfo });
+    console.error(error, errorInfo);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 20, whiteSpace: 'pre-wrap', color: 'red' }}>
+          <h2>Something went wrong.</h2>
+          <details>
+            <summary>Error Details</summary>
+            {this.state.error && this.state.error.toString()}
+            <br />
+            {this.state.errorInfo && this.state.errorInfo.componentStack}
+          </details>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function AppWrapper() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+function App() {
   const [state, setState] = useState<AppState>('landing');
   const [isWebXRSupported, setIsWebXRSupported] = useState(false);
   const [scannedPlanes, setScannedPlanes] = useState<ScannedPlane[]>([]);
+  const [roomLighting, setRoomLighting] = useState<RoomLighting | undefined>(undefined);
 
   useEffect(() => {
     if ('xr' in navigator) {
       (navigator as any).xr?.isSessionSupported('immersive-ar').then((supported: boolean) => {
         setIsWebXRSupported(supported);
-      }).catch(() => {
-        setIsWebXRSupported(false);
       });
     }
   }, []);
 
-  const handleScanComplete = (planes: ScannedPlane[]) => {
-    setScannedPlanes(planes);
+  const handleScanComplete = (planes: ScannedPlane[], scaleFactor: number = 1.0, lighting?: RoomLighting) => {
+    setScannedPlanes(planes.map(p => {
+        // Multiply by scale factor
+        const scaledPoly = p.polygon.map(pt => ({x: pt.x * scaleFactor, y: pt.y * scaleFactor, z: pt.z * scaleFactor}));
+        const scaledPos = {x: p.position.x * scaleFactor, y: p.position.y * scaleFactor, z: p.position.z * scaleFactor};
+        return {...p, polygon: scaledPoly, position: scaledPos};
+    }));
+    setRoomLighting(lighting);
     setState('viewing');
   };
 
@@ -31,8 +73,12 @@ export default function App() {
     return <ARScanner onComplete={handleScanComplete} onCancel={() => setState('landing')} />;
   }
 
+  if (state === 'simulating') {
+    return <ScannerSimulator onComplete={handleScanComplete} onCancel={() => setState('landing')} />;
+  }
+
   if (state === 'viewing') {
-    return <RoomViewer planes={scannedPlanes} onBack={() => setState('landing')} />;
+    return <RoomViewer planes={scannedPlanes} lighting={roomLighting} onBack={() => setState('landing')} />;
   }
 
   return (
@@ -51,12 +97,21 @@ export default function App() {
         </div>
 
         {!isWebXRSupported ? (
-           <div className="bg-red-500/10 border border-red-500/20 p-4 rounded-xl flex gap-3 text-left">
-              <AlertCircle className="w-6 h-6 text-red-400 shrink-0" />
-              <p className="text-sm text-red-200">
-                 Your browser or device does not support WebXR AR or plane detection. 
-                 Try using Chrome on Android or a WebXR viewer app on iOS.
-              </p>
+           <div className="bg-red-500/10 border border-red-500/20 p-4 rounded-xl flex flex-col gap-3 text-left">
+              <div className="flex gap-3">
+                  <AlertCircle className="w-6 h-6 text-red-400 shrink-0" />
+                  <p className="text-sm text-red-200">
+                     Your browser or device does not appear to support WebXR AR or plane detection. 
+                  </p>
+              </div>
+              <Button 
+                variant="outline"
+                className="w-full mt-2 border-red-500/30 text-red-100 hover:bg-red-500/20"
+                onClick={() => setState('simulating')}
+              >
+                 <Wand2 className="w-4 h-4 mr-2" />
+                 Run Simulated Demo Instead
+              </Button>
            </div>
         ) : (
           <div className="space-y-4 pt-6">
@@ -65,6 +120,14 @@ export default function App() {
               onClick={() => setState('scanning')}
             >
               Start Room Scan
+            </Button>
+            <Button 
+              variant="ghost"
+              className="w-full text-indigo-300 hover:text-indigo-200 hover:bg-indigo-500/10" 
+              onClick={() => setState('simulating')}
+            >
+              <Wand2 className="w-4 h-4 mr-2" />
+              Run Simulated Demo Scan
             </Button>
           </div>
         )}
