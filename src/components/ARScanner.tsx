@@ -37,7 +37,8 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     const container = containerRef.current;
     
     let isMounted = true;
-    let renderer: THREE.WebGLRenderer;
+    let renderer: THREE.WebGLRenderer | undefined;
+    let onWindowResize: (() => void) | null = null;
     let currentSession: any = null;
     let planesMap = new Map<any, THREE.Mesh>();
     let scene = new THREE.Scene();
@@ -196,10 +197,10 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
         primaryLightIntensity: 0.0
     };
 
-    const onWindowResize = () => {
+    onWindowResize = () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
+      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
     };
     window.addEventListener('resize', onWindowResize);
 
@@ -704,16 +705,28 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
 
     return () => {
       isMounted = false;
-      window.removeEventListener('resize', onWindowResize);
-      renderer.setAnimationLoop(null);
-      if (currentSession) currentSession.end().catch(() => {});
-      planesMap.forEach((mesh) => {
-          mesh.geometry?.dispose();
-          (mesh.material as THREE.Material)?.dispose();
-      });
-      renderer.dispose();
-      scene.clear();
-      if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
+      if (onWindowResize) {
+        window.removeEventListener('resize', onWindowResize);
+      }
+      if (renderer) {
+        renderer.setAnimationLoop(null);
+        renderer.dispose();
+        if (container && renderer.domElement && container.contains(renderer.domElement)) {
+          container.removeChild(renderer.domElement);
+        }
+      }
+      if (currentSession) {
+        currentSession.end().catch(() => {});
+      }
+      if (planesMap) {
+        planesMap.forEach((mesh) => {
+            mesh.geometry?.dispose();
+            (mesh.material as THREE.Material)?.dispose();
+        });
+      }
+      if (scene) {
+        scene.clear();
+      }
     };
   }, []);
 
