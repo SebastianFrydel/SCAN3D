@@ -19,7 +19,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
   const [activePlanesCount, setActivePlanesCount] = useState(0);
   const planesDataRef = useRef<Map<any, ScannedPlane>>(new Map());
   const startRequestedRef = useRef(false);
-  const arButtonRef = useRef<HTMLButtonElement | null>(null);
+  const arButtonRef = useRef<HTMLElement | null>(null);
   const sessionStartTimerRef = useRef<number | null>(null);
   const [isSessionStarting, setIsSessionStarting] = useState(false);
   const [sessionStartFailed, setSessionStartFailed] = useState(false);
@@ -48,11 +48,10 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     };
     if (overlayDiv) arButtonOptions.domOverlay = { root: overlayDiv };
     const arButton = ARButton.createButton(renderer, arButtonOptions);
-    arButtonRef.current = arButton as HTMLButtonElement;
+    arButtonRef.current = arButton as HTMLElement;
     
     arButton.style.display = 'none';
     container.appendChild(arButton);
-    const clickTimeout = setTimeout(() => {}, 0);
     const onSessionStart = () => {
       if (sessionStartTimerRef.current) window.clearTimeout(sessionStartTimerRef.current);
       setIsSessionStarting(false);
@@ -85,6 +84,10 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
       if (frame) {
         currentSession = renderer.xr.getSession();
         const referenceSpace = renderer.xr.getReferenceSpace();
+        if (!referenceSpace) {
+          renderer.render(scene, camera);
+          return;
+        }
 
         if (frame.detectedPlanes) {
           const detectedPlanes = frame.detectedPlanes;
@@ -117,19 +120,20 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
               setActivePlanesCount(planesMap.size);
             }
 
-            const pose = frame.getPose(plane.planeSpace, referenceSpace);
+            const pose = plane?.planeSpace ? frame.getPose(plane.planeSpace, referenceSpace) : null;
             if (pose && mesh) {
               mesh.position.copy(pose.transform.position);
               mesh.quaternion.copy(pose.transform.orientation);
               
               const poly = [];
-              for (let i = 0; i < plane.polygon.length; i++) {
-                const p = plane.polygon[i];
+              const polygonPoints = plane?.polygon || [];
+              for (let i = 0; i < polygonPoints.length; i++) {
+                const p = polygonPoints[i];
                 poly.push({x: p.x, y: p.y, z: p.z});
               }
 
               const currentVersion = plane.lastChangedTime || timestamp;
-              if (planeGeometryVersion.get(plane) !== currentVersion) {
+              if (poly.length >= 3 && planeGeometryVersion.get(plane) !== currentVersion) {
                 const shape = new THREE.Shape();
                 for (let i = 0; i < poly.length; i++) {
                   const p = poly[i];
@@ -172,7 +176,6 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     animate();
 
     return () => {
-      clearTimeout(clickTimeout);
       if (sessionStartTimerRef.current) {
         window.clearTimeout(sessionStartTimerRef.current);
       }
