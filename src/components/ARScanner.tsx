@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { ARButton } from 'three/examples/jsm/webxr/ARButton.js';
 import { Check, Info, Scan, X } from 'lucide-react';
 import { Button } from './ui/button';
 
@@ -19,7 +18,8 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
   const [activePlanesCount, setActivePlanesCount] = useState(0);
   const planesDataRef = useRef<Map<any, ScannedPlane>>(new Map());
   const startRequestedRef = useRef(false);
-  const arButtonRef = useRef<HTMLElement | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sessionRef = useRef<any>(null);
   const sessionStartTimerRef = useRef<number | null>(null);
   const [isSessionStarting, setIsSessionStarting] = useState(false);
   const [sessionStartFailed, setSessionStartFailed] = useState(false);
@@ -35,29 +35,21 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     scene.add(light);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    rendererRef.current = renderer;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setSize(window.innerWidth, window.innerHeight, false);
     renderer.xr.enabled = true;
     container.appendChild(renderer.domElement);
 
-    const overlayDiv = document.getElementById('ar-overlay');
-    const arButtonOptions: any = {
-      requiredFeatures: ['plane-detection'],
-      optionalFeatures: overlayDiv ? ['dom-overlay'] : []
-    };
-    if (overlayDiv) arButtonOptions.domOverlay = { root: overlayDiv };
-    const arButton = ARButton.createButton(renderer, arButtonOptions);
-    arButtonRef.current = arButton as HTMLElement;
-    
-    arButton.style.display = 'none';
-    container.appendChild(arButton);
     const onSessionStart = () => {
       if (sessionStartTimerRef.current) window.clearTimeout(sessionStartTimerRef.current);
+      startRequestedRef.current = false;
       setIsSessionStarting(false);
       setSessionStartFailed(false);
     };
     const onSessionEnd = () => {
+      sessionRef.current = null;
       startRequestedRef.current = false;
       setIsSessionStarting(false);
     };
@@ -83,6 +75,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     const render = (timestamp: number, frame: any) => {
       if (frame) {
         currentSession = renderer.xr.getSession();
+        sessionRef.current = currentSession;
         const referenceSpace = renderer.xr.getReferenceSpace();
         if (!referenceSpace) {
           renderer.render(scene, camera);
@@ -90,7 +83,9 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
         }
 
         if (frame.detectedPlanes) {
-          const detectedPlanes = frame.detectedPlanes;
+          const detectedPlanes = frame.detectedPlanes instanceof Set
+            ? frame.detectedPlanes
+            : new Set(Array.from(frame.detectedPlanes as Iterable<any>));
           
           detectedPlanes.forEach((plane: any) => {
             let mesh = planesMap.get(plane);
@@ -125,11 +120,13 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
               mesh.position.copy(pose.transform.position);
               mesh.quaternion.copy(pose.transform.orientation);
               
-              const poly = [];
+              const poly: {x: number, y: number, z: number}[] = [];
               const polygonPoints = plane?.polygon || [];
               for (let i = 0; i < polygonPoints.length; i++) {
                 const p = polygonPoints[i];
-                poly.push({x: p.x, y: p.y, z: p.z});
+                if (Number.isFinite(p?.x) && Number.isFinite(p?.y) && Number.isFinite(p?.z)) {
+                  poly.push({x: p.x, y: p.y, z: p.z});
+                }
               }
 
               const currentVersion = plane.lastChangedTime || timestamp;
@@ -140,6 +137,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
                   if (i === 0) shape.moveTo(p.x, -p.z);
                   else shape.lineTo(p.x, -p.z);
                 }
+                shape.closePath();
                 const geom = new THREE.ShapeGeometry(shape);
                 geom.rotateX(-Math.PI / 2); // align to WebXR plane local space (Y is normal)
                 if (mesh.geometry) mesh.geometry.dispose();
@@ -179,12 +177,14 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
       if (sessionStartTimerRef.current) {
         window.clearTimeout(sessionStartTimerRef.current);
       }
-      arButtonRef.current = null;
+      const activeSession = currentSession || sessionRef.current;
+      rendererRef.current = null;
+      sessionRef.current = null;
       renderer.xr.removeEventListener('sessionstart', onSessionStart);
       renderer.xr.removeEventListener('sessionend', onSessionEnd);
       window.removeEventListener('resize', onWindowResize);
       renderer.setAnimationLoop(null);
-      if (currentSession) currentSession.end().catch(() => {});
+      if (activeSession) activeSession.end().catch(() => {});
       planesMap.forEach((mesh) => {
           mesh.geometry?.dispose();
           (mesh.material as THREE.Material)?.dispose();
@@ -192,30 +192,70 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
       renderer.dispose();
       scene.clear();
       if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
-      if (container.contains(arButton)) container.removeChild(arButton);
     };
   }, []);
 
   const handleStartSession = () => {
-    if (startRequestedRef.current) return;
-    startRequestedRef.current = true;
-    setIsSessionStarting(true);
-    setSessionStartFailed(false);
-    const startButton = arButtonRef.current;
-    if (!startButton) {
+    if (startRequestedRef.current || sessionRef.current) return;
+
+    const xr = (navigator as any).xr;
+    const renderer = rendererRef.current;
+    const overlayDiv = document.getElementById('ar-overlay');
+
+    if (!xr?.requestSession || !renderer) {
       setIsSessionStarting(false);
       setSessionStartFailed(true);
       startRequestedRef.current = false;
       return;
     }
-    startButton.click();
+
+    startRequestedRef.current = true;
+    setIsSessionStarting(true);
+    setSessionStartFailed(false);
+
+    const sessionInit: any = {
+      requiredFeatures: ['plane-detection'],
+      optionalFeatures: overlayDiv ? ['dom-overlay'] : []
+    };
+    if (overlayDiv) sessionInit.domOverlay = { root: overlayDiv };
+
+    renderer.xr.setReferenceSpaceType('local');
+
+    xr.requestSession('immersive-ar', sessionInit)
+      .then(async (session: any) => {
+        sessionRef.current = session;
+        try {
+          await renderer.xr.setSession(session);
+          if (sessionStartTimerRef.current) window.clearTimeout(sessionStartTimerRef.current);
+          startRequestedRef.current = false;
+          setIsSessionStarting(false);
+          setSessionStartFailed(false);
+        } catch (error) {
+          sessionRef.current = null;
+          try {
+            await session.end();
+          } catch {
+            // Session may already be closed by the browser.
+          }
+          throw error;
+        }
+      })
+      .catch((error: unknown) => {
+        console.warn('Unable to start AR scan session', error);
+        if (sessionStartTimerRef.current) window.clearTimeout(sessionStartTimerRef.current);
+        sessionRef.current = null;
+        startRequestedRef.current = false;
+        setIsSessionStarting(false);
+        setSessionStartFailed(true);
+      });
+
     sessionStartTimerRef.current = window.setTimeout(() => {
       if (startRequestedRef.current) {
         setIsSessionStarting(false);
         setSessionStartFailed(true);
         startRequestedRef.current = false;
       }
-    }, 1800);
+    }, 4000);
   };
 
   const handleFinish = () => {
@@ -239,7 +279,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
              </Button>
              {sessionStartFailed && (
                <p className="text-xs text-amber-300 bg-amber-500/10 border border-amber-400/30 rounded-lg px-3 py-2">
-                 Could not start AR session. Please tap again and allow camera access.
+                 Could not start AR session. Please allow camera access and use a browser/device with WebXR plane detection.
                </p>
              )}
              <div className="bg-black/50 backdrop-blur text-white px-4 py-2 rounded-xl border border-white/10 shadow-lg">
