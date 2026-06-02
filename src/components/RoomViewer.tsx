@@ -393,6 +393,27 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
     });
   }, [planes]);
 
+  const enhancedWallGeometries = useMemo(() => {
+    return enhancedWalls.map(w => ({
+      id: w.id,
+      geometry: new THREE.PlaneGeometry(w.width, w.height)
+    }));
+  }, [enhancedWalls]);
+  const enhancedWallGeometryMap = useMemo(() => {
+    return new Map(enhancedWallGeometries.map((wg) => [wg.id, wg.geometry]));
+  }, [enhancedWallGeometries]);
+
+  useEffect(() => {
+    return () => {
+      floorHull.dispose();
+      ceilingHull.dispose();
+      rawPlaneMeshes.forEach((pm) => pm.geometry.dispose());
+      enhancedWallGeometries.forEach((wg) => {
+        wg.geometry.dispose();
+      });
+    };
+  }, [floorHull, ceilingHull, rawPlaneMeshes, enhancedWallGeometries]);
+
   const handleApplyMaterial = (matType: MaterialType) => {
       if (selectedMeshId) {
           setCustomMaterials(prev => ({
@@ -670,75 +691,61 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
               </mesh>
             ))}
 
-            {viewMode === 'enhanced' && (
-              <React.Suspense fallback={null}>
-                {/* Floor */}
-                <mesh 
-                   geometry={floorHull} 
-                   position={[0, floorY, 0]}
-                   onClick={(e) => { e.stopPropagation(); setSelectedMeshId('floor'); }}
-                >
-                   <meshPhysicalMaterial 
-                       {...(customMaterials['floor'] ? MATERIAL_PRESETS[customMaterials['floor']] : MATERIAL_PRESETS.defaultFloor)} 
-                       map={getMaterialMap(customMaterials['floor'] || 'defaultFloor')}
-                       side={THREE.DoubleSide} 
-                       transparent={false} 
-                       opacity={1} 
-                       emissive={(selectedMeshId === 'floor') ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
-                   />
-                   <lineSegments>
-                     <edgesGeometry args={[floorHull]} />
-                     <lineBasicMaterial color={(selectedMeshId === 'floor') ? '#fff' : '#000000'} linewidth={2} opacity={0.6} transparent />
-                   </lineSegments>
-                </mesh>
+            {viewMode === 'enhanced' && (() => {
+                const floorMatProps = customMaterials['floor'] ? MATERIAL_PRESETS[customMaterials['floor']] : MATERIAL_PRESETS.defaultFloor;
+                const isFloorSelected = selectedMeshId === 'floor';
 
-                {/* Ceiling */}
-                <mesh geometry={ceilingHull} position={[0, ceilingY, 0]}>
-                   <meshPhysicalMaterial 
-                       color={0xf8fafc} 
-                       map={plasterTexture}
-                       side={THREE.DoubleSide} 
-                       transparent={false} 
-                       opacity={1} 
-                       roughness={0.9} 
-                       metalness={0.0}
-                   />
-                   <lineSegments>
-                     <edgesGeometry args={[ceilingHull]} />
-                     <lineBasicMaterial color="#000000" linewidth={2} opacity={0.6} transparent />
-                   </lineSegments>
-                </mesh>
+                return (
+                  <>
+                     {/* Floor */}
+                     <mesh 
+                        geometry={floorHull} 
+                        position={[0, floorY, 0]}
+                        onClick={(e) => { e.stopPropagation(); setSelectedMeshId('floor'); }}
+                     >
+                        <meshPhysicalMaterial 
+                            {...floorMatProps} 
+                            side={THREE.DoubleSide} 
+                            transparent={false} 
+                            opacity={1} 
+                            emissive={isFloorSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
+                        />
+                        <lineSegments>
+                          <edgesGeometry args={[floorHull]} />
+                          <lineBasicMaterial color={isFloorSelected ? '#fff' : '#10b981'} linewidth={3} opacity={isFloorSelected ? 1 : 0.6} transparent />
+                        </lineSegments>
+                     </mesh>
 
-                {/* Walls */}
-                {enhancedWalls.map(w => (
-                   <WallMesh 
-                       key={w.id}
-                       w={w}
-                       isSelected={selectedMeshId === w.id}
-                       matProps={customMaterials[w.id] ? MATERIAL_PRESETS[customMaterials[w.id]] : MATERIAL_PRESETS.defaultWall}
-                       map={getMaterialMap(customMaterials[w.id])}
-                       onClick={(e) => { e.stopPropagation(); setSelectedMeshId(w.id); }}
-                   />
-                ))}
+                     {/* Ceiling */}
+                     <mesh geometry={ceilingHull} position={[0, ceilingY, 0]}>
+                        <meshPhysicalMaterial color={0x10b981} side={THREE.DoubleSide} transparent opacity={0.1} roughness={0.2} metalness={0.1} />
+                     </mesh>
 
-                {/* Objects */}
-                {objects && objects.map(o => {
-                    let color = '#f59e0b';
-                    if (o.type === 'chair') color = '#f43f5e';
-                    if (o.type === 'sofa') color = '#d946ef';
-                    if (o.type === 'wardrobe') color = '#f97316';
-                    if (o.type === 'tv') color = '#14b8a6';
-                    const isSelected = selectedMeshId === o.id;
+                     {/* Walls */}
+                     {enhancedWalls.map(w => {
+                        const matProps = customMaterials[w.id] ? MATERIAL_PRESETS[customMaterials[w.id]] : MATERIAL_PRESETS.defaultWall;
+                        const isSelected = selectedMeshId === w.id;
+                        const wallGeometry = enhancedWallGeometryMap.get(w.id);
+                        if (!wallGeometry) return null;
 
-                    return (
-                        <group key={o.id} position={o.position} quaternion={o.quaternion}>
-                            <mesh onClick={(e) => { e.stopPropagation(); setSelectedMeshId(o.id); }}>
-                                <boxGeometry args={[o.width, o.height, o.depth]} />
-                                <meshPhysicalMaterial color={color} transparent opacity={0.6} roughness={0.5} metalness={0.1} emissive={isSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)} />
-                                <lineSegments>
-                                    <edgesGeometry args={[new THREE.BoxGeometry(o.width, o.height, o.depth)]} />
-                                    <lineBasicMaterial color={isSelected ? '#ffffff' : color} linewidth={2} />
-                                </lineSegments>
+                        return (
+                          <group key={w.id} position={w.position} quaternion={w.quaternion}>
+                            <mesh 
+                                rotation={[-Math.PI / 2, 0, 0]}
+                                onClick={(e) => { e.stopPropagation(); setSelectedMeshId(w.id); }}
+                                geometry={wallGeometry}
+                            >
+                               <meshPhysicalMaterial 
+                                    {...matProps} 
+                                    side={THREE.DoubleSide} 
+                                    transparent={false} 
+                                    opacity={1} 
+                                    emissive={isSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
+                               />
+                               <lineSegments>
+                                 <edgesGeometry args={[wallGeometry]} />
+                                 <lineBasicMaterial color={isSelected ? '#fff' : '#3b82f6'} linewidth={3} opacity={isSelected ? 1 : 0.6} transparent />
+                               </lineSegments>
                             </mesh>
                         </group>
                     );

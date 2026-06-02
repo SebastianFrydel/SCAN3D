@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { Check, Info, X, Map as MapIcon, ArrowDown, ArrowRight, ArrowLeft, RefreshCw, Compass } from 'lucide-react';
+import { Check, Info, Scan, X } from 'lucide-react';
 import { Button } from './ui/button';
 import { RoomReconstruction } from '../core/processing/RoomReconstruction';
 import { RoomLighting, RoomModel } from '../core/models/types';
@@ -23,162 +23,45 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
   const containerRef = useRef<HTMLDivElement>(null);
   const [activePlanesCount, setActivePlanesCount] = useState(0);
   const planesDataRef = useRef<Map<any, ScannedPlane>>(new Map());
-  const [isSupported, setIsSupported] = useState<boolean | null>(null);
-  const [scanQuality, setScanQuality] = useState<'low' | 'medium' | 'high'>('low');
-  const [scanStats, setScanStats] = useState({ floorArea: 0, wallArea: 0, ceilingArea: 0, featureCount: 0, roomHeight: 0 });
-  const [liveRoomModel, setLiveRoomModel] = useState<RoomModel | null>(null);
-  const [guidanceTip, setGuidanceTip] = useState<string>('Point at floor to start');
-  const [guidanceIcon, setGuidanceIcon] = useState<React.ReactNode>(<ArrowDown className="w-8 h-8 md:w-12 md:h-12" />);
-
-  const engineApiRef = useRef<any>(null);
+  const startRequestedRef = useRef(false);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sessionRef = useRef<any>(null);
+  const sessionStartTimerRef = useRef<number | null>(null);
+  const [isSessionStarting, setIsSessionStarting] = useState(false);
+  const [sessionStartFailed, setSessionStartFailed] = useState(false);
 
   useEffect(() => {
     if (!containerRef.current) return;
     const container = containerRef.current;
     
-    let isMounted = true;
-    let renderer: THREE.WebGLRenderer | undefined;
-    let onWindowResize: (() => void) | null = null;
-    let currentSession: any = null;
-    let planesMap = new Map<any, THREE.Mesh>();
-    let scene = new THREE.Scene();
-    
-    try {
-        const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
-        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
-        light.position.set(0.5, 1, 0.25);
-        scene.add(light);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+    const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+    light.position.set(0.5, 1, 0.25);
+    scene.add(light);
 
-        const wireframeGroup = new THREE.Group();
-        scene.add(wireframeGroup);
-        
-        // Add guidance animations group
-        const guidanceAnimGroup = new THREE.Group();
-        scene.add(guidanceAnimGroup);
-
-        // Create a pulsing circle for the floor
-        const floorCircleGeom = new THREE.RingGeometry(0.3, 0.4, 32);
-        const floorCircleMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.8, side: THREE.DoubleSide });
-        const floorCircle = new THREE.Mesh(floorCircleGeom, floorCircleMat);
-        floorCircle.rotation.x = -Math.PI / 2;
-        floorCircle.visible = false;
-        guidanceAnimGroup.add(floorCircle);
-
-        // Create animated arrows to indicate panning
-        const arrowGeom = new THREE.ConeGeometry(0.05, 0.2, 8);
-        const arrowMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.8 });
-        const movingArrow = new THREE.Mesh(arrowGeom, arrowMat);
-        movingArrow.visible = false;
-        guidanceAnimGroup.add(movingArrow);
-
-    let frameCount = 0;
-
-    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    rendererRef.current = renderer;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
     renderer.xr.enabled = true;
     // renderer.xr.setFramebufferScaleFactor(window.devicePixelRatio);
     container.appendChild(renderer.domElement);
 
-    const startAR = async () => {
-        if (isWebXRRequesting) {
-            console.warn("WebXR is already requesting a session. Ignoring duplicate request.");
-            return;
-        }
-        
-        const xr = (navigator as any).xr;
-        if (!xr) {
-            if (isMounted) setIsSupported(false);
-            return;
-        }
-
-        isWebXRRequesting = true;
-
-        try {
-            const supported = await xr.isSessionSupported('immersive-ar');
-            if (!supported) {
-                if (isMounted) setIsSupported(false);
-                isWebXRRequesting = false;
-                return;
-            }
-        } catch (e) {
-            console.warn("isSessionSupported failed:", e);
-            if (isMounted) setIsSupported(false);
-            isWebXRRequesting = false;
-            return;
-        }
-
-        const overlayDiv = document.getElementById('ar-overlay');
-        
-        try {
-            const session = await xr.requestSession('immersive-ar', {
-                requiredFeatures: ['plane-detection'],
-                optionalFeatures: ['dom-overlay', 'local-floor', 'light-estimation', 'camera-access'],
-                domOverlay: overlayDiv ? { root: overlayDiv } : undefined
-            });
-            isWebXRRequesting = false;
-            if (!isMounted) {
-                session.end();
-                return;
-            }
-            renderer.xr.setReferenceSpaceType('local-floor');
-            await renderer.xr.setSession(session);
-            currentSession = session;
-            setIsSupported(true);
-        } catch (err: any) {
-            console.warn("AR Session error (full features):", err);
-            
-            if (err.message?.includes('already an active')) {
-                isWebXRRequesting = false;
-                return;
-            }
-
-            try {
-                // Fallback attempt without plane-detection as required
-                const fallbackSession = await xr.requestSession('immersive-ar', {
-                    optionalFeatures: ['dom-overlay', 'local-floor', 'light-estimation', 'camera-access'],
-                    domOverlay: overlayDiv ? { root: overlayDiv } : undefined
-                });
-                isWebXRRequesting = false;
-                if (!isMounted) {
-                    fallbackSession.end();
-                    return;
-                }
-                renderer.xr.setReferenceSpaceType('local-floor');
-                await renderer.xr.setSession(fallbackSession);
-                currentSession = fallbackSession;
-                setIsSupported(true);
-            } catch (fallbackErr: any) {
-                console.warn("AR Session fallback error with dom-overlay:", fallbackErr);
-                
-                try {
-                    // Final bare minimum fallback
-                    const bareSession = await xr.requestSession('immersive-ar', {
-                        optionalFeatures: ['local-floor', 'light-estimation']
-                    });
-                    isWebXRRequesting = false;
-                    if (!isMounted) {
-                        bareSession.end();
-                        return;
-                    }
-                    renderer.xr.setReferenceSpaceType('local-floor');
-                    await renderer.xr.setSession(bareSession);
-                    currentSession = bareSession;
-                    setIsSupported(true);
-                } catch (bareErr: any) {
-                    isWebXRRequesting = false;
-                    console.warn("AR Session bare fallback error:", bareErr);
-                    if (isMounted) setIsSupported(false);
-                }
-            }
-        }
+    const onSessionStart = () => {
+      if (sessionStartTimerRef.current) window.clearTimeout(sessionStartTimerRef.current);
+      startRequestedRef.current = false;
+      setIsSessionStarting(false);
+      setSessionStartFailed(false);
     };
-    
-    // We bind it to window so we can trigger it from React state easily without losing closure
-    (window as any)._startAR = startAR;
-    
-    // Try auto-starting if possible (sometimes works if transient activation carried over)
-    startAR().catch(() => {});
+    const onSessionEnd = () => {
+      sessionRef.current = null;
+      startRequestedRef.current = false;
+      setIsSessionStarting(false);
+    };
+    renderer.xr.addEventListener('sessionstart', onSessionStart);
+    renderer.xr.addEventListener('sessionend', onSessionEnd);
 
     let planeIdCounter = 0;
     let planeSupportChecked = false;
@@ -212,10 +95,16 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
       renderer.setAnimationLoop(render);
     };
 
+    const planeGeometryVersion = new Map<any, number>();
     const render = (timestamp: number, frame: any) => {
       if (frame) {
         currentSession = renderer.xr.getSession();
+        sessionRef.current = currentSession;
         const referenceSpace = renderer.xr.getReferenceSpace();
+        if (!referenceSpace) {
+          renderer.render(scene, camera);
+          return;
+        }
 
         // Ensure the camera matches the device pose continuously
         const viewerPose = frame.getViewerPose(referenceSpace);
@@ -289,7 +178,9 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
         }
 
         if (frame.detectedPlanes) {
-          const detectedPlanes = frame.detectedPlanes;
+          const detectedPlanes = frame.detectedPlanes instanceof Set
+            ? frame.detectedPlanes
+            : new Set(Array.from(frame.detectedPlanes as Iterable<any>));
           
           detectedPlanes.forEach((plane: any) => {
             const pose = frame.getPose(plane.planeSpace, referenceSpace);
@@ -450,17 +341,45 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
                 quaternion: {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w},
                 lastSeen: Date.now()
               });
-            } else {
-              data.semanticLabel = semanticClass;
-              data.color = color;
+              setActivePlanesCount(planesMap.size);
+            }
+
+            const pose = plane?.planeSpace ? frame.getPose(plane.planeSpace, referenceSpace) : null;
+            if (pose && mesh) {
+              mesh.position.copy(pose.transform.position);
+              mesh.quaternion.copy(pose.transform.orientation);
               
-              // Instead of overwriting polygon entirely, we let WebXR's plane tracking handle it 
-              // as this provides refined boundary updates over time, but we don't delete them.
-              data.polygon = poly;
-              
-              data.position = {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z};
-              data.quaternion = {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w};
-              data.lastSeen = Date.now();
+              const poly: {x: number, y: number, z: number}[] = [];
+              const polygonPoints = plane?.polygon || [];
+              for (let i = 0; i < polygonPoints.length; i++) {
+                const p = polygonPoints[i];
+                if (Number.isFinite(p?.x) && Number.isFinite(p?.y) && Number.isFinite(p?.z)) {
+                  poly.push({x: p.x, y: p.y, z: p.z});
+                }
+              }
+
+              const currentVersion = plane.lastChangedTime || timestamp;
+              if (poly.length >= 3 && planeGeometryVersion.get(plane) !== currentVersion) {
+                const shape = new THREE.Shape();
+                for (let i = 0; i < poly.length; i++) {
+                  const p = poly[i];
+                  if (i === 0) shape.moveTo(p.x, -p.z);
+                  else shape.lineTo(p.x, -p.z);
+                }
+                shape.closePath();
+                const geom = new THREE.ShapeGeometry(shape);
+                geom.rotateX(-Math.PI / 2); // align to WebXR plane local space (Y is normal)
+                if (mesh.geometry) mesh.geometry.dispose();
+                mesh.geometry = geom;
+                planeGeometryVersion.set(plane, currentVersion);
+              }
+
+              const data = planesDataRef.current.get(plane);
+              if (data) {
+                data.polygon = poly;
+                data.position = {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z};
+                data.quaternion = {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w};
+              }
             }
           });
 
@@ -469,7 +388,13 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
           const now = Date.now();
           planesMap.forEach((mesh, plane) => {
             if (!detectedPlanes.has(plane)) {
-              mesh.visible = false;
+              scene.remove(mesh);
+              mesh.geometry?.dispose();
+              (mesh.material as THREE.Material)?.dispose();
+              planesMap.delete(plane);
+              planeGeometryVersion.delete(plane);
+              planesDataRef.current.delete(plane);
+              setActivePlanesCount(planesMap.size);
             }
           });
           
@@ -704,31 +629,89 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     } catch (err) { console.error("AR Start error", err); }
 
     return () => {
-      isMounted = false;
-      if (onWindowResize) {
-        window.removeEventListener('resize', onWindowResize);
+      if (sessionStartTimerRef.current) {
+        window.clearTimeout(sessionStartTimerRef.current);
       }
-      if (renderer) {
-        renderer.setAnimationLoop(null);
-        renderer.dispose();
-        if (container && renderer.domElement && container.contains(renderer.domElement)) {
-          container.removeChild(renderer.domElement);
-        }
-      }
-      if (currentSession) {
-        currentSession.end().catch(() => {});
-      }
-      if (planesMap) {
-        planesMap.forEach((mesh) => {
-            mesh.geometry?.dispose();
-            (mesh.material as THREE.Material)?.dispose();
-        });
-      }
-      if (scene) {
-        scene.clear();
-      }
+      const activeSession = currentSession || sessionRef.current;
+      rendererRef.current = null;
+      sessionRef.current = null;
+      renderer.xr.removeEventListener('sessionstart', onSessionStart);
+      renderer.xr.removeEventListener('sessionend', onSessionEnd);
+      window.removeEventListener('resize', onWindowResize);
+      renderer.setAnimationLoop(null);
+      if (activeSession) activeSession.end().catch(() => {});
+      planesMap.forEach((mesh) => {
+          mesh.geometry?.dispose();
+          (mesh.material as THREE.Material)?.dispose();
+      });
+      renderer.dispose();
+      scene.clear();
+      if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
     };
   }, []);
+
+  const handleStartSession = () => {
+    if (startRequestedRef.current || sessionRef.current) return;
+
+    const xr = (navigator as any).xr;
+    const renderer = rendererRef.current;
+    const overlayDiv = document.getElementById('ar-overlay');
+
+    if (!xr?.requestSession || !renderer) {
+      setIsSessionStarting(false);
+      setSessionStartFailed(true);
+      startRequestedRef.current = false;
+      return;
+    }
+
+    startRequestedRef.current = true;
+    setIsSessionStarting(true);
+    setSessionStartFailed(false);
+
+    const sessionInit: any = {
+      requiredFeatures: ['plane-detection'],
+      optionalFeatures: overlayDiv ? ['dom-overlay'] : []
+    };
+    if (overlayDiv) sessionInit.domOverlay = { root: overlayDiv };
+
+    renderer.xr.setReferenceSpaceType('local');
+
+    xr.requestSession('immersive-ar', sessionInit)
+      .then(async (session: any) => {
+        sessionRef.current = session;
+        try {
+          await renderer.xr.setSession(session);
+          if (sessionStartTimerRef.current) window.clearTimeout(sessionStartTimerRef.current);
+          startRequestedRef.current = false;
+          setIsSessionStarting(false);
+          setSessionStartFailed(false);
+        } catch (error) {
+          sessionRef.current = null;
+          try {
+            await session.end();
+          } catch {
+            // Session may already be closed by the browser.
+          }
+          throw error;
+        }
+      })
+      .catch((error: unknown) => {
+        console.warn('Unable to start AR scan session', error);
+        if (sessionStartTimerRef.current) window.clearTimeout(sessionStartTimerRef.current);
+        sessionRef.current = null;
+        startRequestedRef.current = false;
+        setIsSessionStarting(false);
+        setSessionStartFailed(true);
+      });
+
+    sessionStartTimerRef.current = window.setTimeout(() => {
+      if (startRequestedRef.current) {
+        setIsSessionStarting(false);
+        setSessionStartFailed(true);
+        startRequestedRef.current = false;
+      }
+    }, 4000);
+  };
 
   const handleFinish = () => {
       const planesArray = Array.from(planesDataRef.current.values());
@@ -758,30 +741,23 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
         >
           <div className="flex justify-between items-start z-10 w-full">
            <div className="space-y-4 pointer-events-auto">
-             <div className="bg-black/50 backdrop-blur w-44 text-white px-4 py-3 rounded-xl border border-white/10 shadow-lg flex flex-col gap-2">
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Planes</span>
-                   <span className="text-white font-mono">{activePlanesCount}</span>
-                </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Floor Area</span>
-                   <span className="text-emerald-400 font-mono">{scanStats.floorArea.toFixed(1)} m²</span>
-                </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Ceiling Area</span>
-                   <span className="text-cyan-400 font-mono">{scanStats.ceilingArea.toFixed(1)} m²</span>
-                </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Wall Area</span>
-                   <span className="text-blue-400 font-mono">{scanStats.wallArea.toFixed(1)} m²</span>
-                </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Height</span>
-                   <span className="text-rose-400 font-mono">{scanStats.roomHeight > 0.1 ? scanStats.roomHeight.toFixed(2) + 'm' : '--'}</span>
-                </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Features</span>
-                   <span className="text-purple-400 font-mono">{scanStats.featureCount}</span>
+             <Button
+               onClick={handleStartSession}
+               disabled={isSessionStarting}
+               className="bg-indigo-600 hover:bg-indigo-500 text-white w-full"
+             >
+               <Scan className="w-5 h-5 mr-2" />
+               {isSessionStarting ? 'Starting AR…' : 'Start AR Session'}
+             </Button>
+             {sessionStartFailed && (
+               <p className="text-xs text-amber-300 bg-amber-500/10 border border-amber-400/30 rounded-lg px-3 py-2">
+                 Could not start AR session. Please allow camera access and use a browser/device with WebXR plane detection.
+               </p>
+             )}
+             <div className="bg-black/50 backdrop-blur text-white px-4 py-2 rounded-xl border border-white/10 shadow-lg">
+                <div className="text-xs text-slate-300 font-semibold mb-1 uppercase tracking-wider">Detected Surfaces</div>
+                <div className="text-3xl font-bold font-mono">
+                    {activePlanesCount}
                 </div>
              </div>
              
