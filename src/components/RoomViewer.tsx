@@ -206,14 +206,26 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
     });
   }, [planes]);
 
+  const enhancedWallGeometries = useMemo(() => {
+    return enhancedWalls.map(w => ({
+      id: w.id,
+      geometry: new THREE.PlaneGeometry(w.width, w.height)
+    }));
+  }, [enhancedWalls]);
+  const enhancedWallGeometryMap = useMemo(() => {
+    return new Map(enhancedWallGeometries.map((wg) => [wg.id, wg.geometry]));
+  }, [enhancedWallGeometries]);
 
   useEffect(() => {
     return () => {
       floorHull.dispose();
       ceilingHull.dispose();
       rawPlaneMeshes.forEach((pm) => pm.geometry.dispose());
+      enhancedWallGeometries.forEach((wg) => {
+        wg.geometry.dispose();
+      });
     };
-  }, [floorHull, ceilingHull, rawPlaneMeshes]);
+  }, [floorHull, ceilingHull, rawPlaneMeshes, enhancedWallGeometries]);
 
   const handleApplyMaterial = (matType: MaterialType) => {
       if (selectedMeshId) {
@@ -344,14 +356,16 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
                      {enhancedWalls.map(w => {
                         const matProps = customMaterials[w.id] ? MATERIAL_PRESETS[customMaterials[w.id]] : MATERIAL_PRESETS.defaultWall;
                         const isSelected = selectedMeshId === w.id;
+                        const wallGeometry = enhancedWallGeometryMap.get(w.id);
+                        if (!wallGeometry) return null;
 
                         return (
                           <group key={w.id} position={w.position} quaternion={w.quaternion}>
                             <mesh 
                                 rotation={[-Math.PI / 2, 0, 0]}
                                 onClick={(e) => { e.stopPropagation(); setSelectedMeshId(w.id); }}
+                                geometry={wallGeometry}
                             >
-                               <planeGeometry args={[w.width, w.height]} />
                                <meshPhysicalMaterial 
                                     {...matProps} 
                                     side={THREE.DoubleSide} 
@@ -360,7 +374,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
                                     emissive={isSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
                                />
                                <lineSegments>
-                                 <edgesGeometry args={[new THREE.PlaneGeometry(w.width, w.height)]} />
+                                 <edgesGeometry args={[wallGeometry]} />
                                  <lineBasicMaterial color={isSelected ? '#fff' : '#3b82f6'} linewidth={3} opacity={isSelected ? 1 : 0.6} transparent />
                                </lineSegments>
                             </mesh>
