@@ -2,6 +2,9 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { Check, Info, Scan, X } from 'lucide-react';
 import { Button } from './ui/button';
+import { RoomReconstruction } from '../core/processing/RoomReconstruction';
+import { RoomLighting, RoomModel } from '../core/models/types';
+import { MiniMap } from './MiniMap';
 
 export interface ScannedPlane {
   id: number;
@@ -11,6 +14,7 @@ export interface ScannedPlane {
   position: {x: number, y: number, z: number};
   quaternion: {x: number, y: number, z: number, w: number};
   color: number;
+  lastSeen: number;
 }
 
 const SESSION_START_TIMEOUT_MS = 8000;
@@ -97,6 +101,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setSize(window.innerWidth, window.innerHeight, false);
     renderer.xr.enabled = true;
+    // renderer.xr.setFramebufferScaleFactor(window.devicePixelRatio);
     container.appendChild(renderer.domElement);
 
     const onSessionStart = () => {
@@ -118,11 +123,26 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     const planesMap = new Map<any, THREE.Mesh>();
     let currentSession: XRSessionLike | null = null;
     let planeIdCounter = 0;
+    let planeSupportChecked = false;
+    let lastScanTime = Date.now();
+    let lastPlaneCount = 0;
+    let slowProgressCount = 0;
+    let xrLightProbe: any = null;
+    let lightProbeRequested = false;
+    
+    // Store latest room lighting
+    const currentLighting = {
+        ambientColor: 0xffffff,
+        ambientIntensity: 0.5,
+        primaryLightDirection: [0, -1, 0] as [number, number, number],
+        primaryLightColor: 0xffffff,
+        primaryLightIntensity: 0.0
+    };
 
-    const onWindowResize = () => {
+    onWindowResize = () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
     };
     window.addEventListener('resize', onWindowResize);
 
@@ -140,6 +160,110 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
         const detectedPlanes = getDetectedPlaneSet(frame.detectedPlanes);
         if (detectedPlanes) {
           detectedPlanes.forEach((plane: any) => {
+            const pose = frame.getPose(plane.planeSpace, referenceSpace);
+            if (!pose) return;
+
+            const isHoriz = plane.orientation?.toLowerCase() === 'horizontal';
+            const isVert = plane.orientation?.toLowerCase() === 'vertical';
+
+            const normal = new THREE.Vector3(0, 1, 0).applyQuaternion(pose.transform.orientation);
+            let isValidAngle = true;
+            if (isHoriz && Math.abs(normal.y) < 0.85) isValidAngle = false;
+            if (isVert && Math.abs(normal.y) > 0.15) isValidAngle = false;
+
+            let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+            let worldMinY = Infinity, worldMaxY = -Infinity;
+            for (let i = 0; i < plane.polygon.length; i++) {
+              const p = plane.polygon[i];
+              minX = Math.min(minX, p.x);
+              maxX = Math.max(maxX, p.x);
+              minZ = Math.min(minZ, p.z);
+              maxZ = Math.max(maxZ, p.z);
+
+              const wp = new THREE.Vector3(p.x, p.y, p.z)
+                            .applyQuaternion(pose.transform.orientation)
+                            .add(new THREE.Vector3(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z));
+              worldMinY = Math.min(worldMinY, wp.y);
+              worldMaxY = Math.max(worldMaxY, wp.y);
+            }
+            const areaApprox = (maxX - minX) * (maxZ - minZ);
+            
+            // Improved detection heuristics based on physical dimensions
+            const heightApprox = worldMaxY - worldMinY;
+            const widthApprox = areaApprox / Math.max(0.001, heightApprox);
+
+            let semanticClass = plane.semanticLabel?.toLowerCase();
+            
+            // If missing or just "wall", analyze shape to refine detection
+            if (!semanticClass || semanticClass === 'unknown' || semanticClass === 'wall') {
+              if (isHoriz) {
+                if (pose.transform.position.y < 0.3) semanticClass = 'floor';
+                else if (pose.transform.position.y > 1.8) semanticClass = 'ceiling';
+                else if (pose.transform.position.y < 0.65 && areaApprox < 0.6) semanticClass = 'chair';
+                else if (pose.transform.position.y < 0.65 && areaApprox >= 0.6) semanticClass = 'sofa';
+                else if (areaApprox < 3.0) semanticClass = 'table';
+                else semanticClass = 'unknown';
+              } else if (isVert) {
+                // Door: reaches floor, typ. 1.9-2.2m tall, 0.7-1.2m wide
+                if (worldMinY < 0.4 && heightApprox > 1.8 && widthApprox >= 0.6 && widthApprox <= 1.4) {
+                   semanticClass = 'door';
+                } 
+                // Window: floating off floor, reasonable size
+                else if (worldMinY >= 0.5 && heightApprox >= 0.4 && widthApprox >= 0.4 && widthApprox <= 3.0) {
+                   semanticClass = 'window';
+                }
+                // Wardrobe / Tall Cabinet: thick, not too wide, sitting on floor
+                else if (worldMinY < 0.3 && widthApprox >= 0.4 && widthApprox <= 2.5 && heightApprox >= 1.0 && heightApprox <= 2.8) {
+                   semanticClass = 'wardrobe';
+                }
+                // TV / Monitor: floating, very thin
+                else if (worldMinY >= 0.5 && widthApprox >= 0.6 && widthApprox <= 2.0 && heightApprox >= 0.4 && heightApprox <= 1.5) {
+                   semanticClass = 'tv';
+                }
+                // Door frame / Pillar / Edge: tall but narrow
+                else if (widthApprox < 0.4 && heightApprox > 1.2) {
+                   semanticClass = 'door_frame';
+                }
+                else {
+                   semanticClass = 'wall';
+                }
+              } else {
+                 semanticClass = 'unknown';
+              }
+            }
+
+            let requiredArea = 0.1;
+            // Lowered thresholds to detect smaller features like door frames and complex room geometries
+            if (semanticClass === 'door_frame') {
+               requiredArea = 0.01;
+            } else if (['table', 'chair', 'sofa', 'door', 'window'].includes(semanticClass)) {
+               requiredArea = 0.02; // Very small for frames and furniture
+            } else if (semanticClass === 'floor' || semanticClass === 'ceiling') {
+               requiredArea = 0.1; 
+            } else if (semanticClass === 'wall') {
+               requiredArea = 0.05; // Lowered to catch short partition walls and corners
+            }
+
+            if (!isValidAngle || areaApprox < requiredArea) {
+               let mesh = planesMap.get(plane);
+               if (mesh) mesh.visible = false;
+               planesDataRef.current.delete(plane);
+               return;
+            }
+
+            let color = 0x9ca3af; 
+            if (semanticClass === 'floor') color = 0x10b981; 
+            else if (semanticClass === 'ceiling') color = 0x06b6d4; 
+            else if (semanticClass === 'wall') color = 0x3b82f6; 
+            else if (semanticClass === 'door_frame') color = 0xec4899; 
+            else if (semanticClass === 'table') color = 0xf59e0b; 
+            else if (semanticClass === 'chair') color = 0xf43f5e; 
+            else if (semanticClass === 'sofa') color = 0xd946ef; 
+            else if (semanticClass === 'door') color = 0x8b5cf6; 
+            else if (semanticClass === 'window') color = 0x38bdf8; 
+            else if (semanticClass === 'wardrobe') color = 0xf97316; // Orange
+            else if (semanticClass === 'tv') color = 0x14b8a6; // Teal 
+
             let mesh = planesMap.get(plane);
             if (!mesh) {
               const orientation = typeof plane.orientation === 'string' ? plane.orientation : 'unknown';
@@ -148,21 +272,54 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
               const material = new THREE.MeshBasicMaterial({
                 color: color,
                 transparent: true,
-                opacity: 0.6,
-                side: THREE.DoubleSide
+                opacity: 0.8,
+                linewidth: 2
               });
-              mesh = new THREE.Mesh(new THREE.BufferGeometry(), material);
+              const geom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0)]);
+              mesh = new THREE.LineLoop(geom, material) as unknown as THREE.Mesh;
+              
               scene.add(mesh);
               planesMap.set(plane, mesh);
-              
+            } else {
+              mesh.visible = true;
+              (mesh.material as THREE.LineBasicMaterial).color.setHex(color);
+            }
+
+            mesh.position.copy(pose.transform.position);
+            mesh.quaternion.copy(pose.transform.orientation);
+            
+            // Only rebuild geometry if polygon changed size or every 30 frames to avoid memory exhaustion
+            const rebuildGeom = !mesh.userData.lastPolyLength || mesh.userData.lastPolyLength !== plane.polygon.length || (frameCount % 60 === 0);
+
+            const poly = [];
+            for (let i = 0; i < plane.polygon.length; i++) {
+              const p = plane.polygon[i];
+              poly.push({x: p.x, y: p.y, z: p.z});
+            }
+
+            if (rebuildGeom) {
+                mesh.userData.lastPolyLength = plane.polygon.length;
+                const points = [];
+                for (let i = 0; i < plane.polygon.length; i++) {
+                  const p = plane.polygon[i];
+                  points.push(new THREE.Vector3(p.x, 0, p.z));
+                }
+                const geom = new THREE.BufferGeometry().setFromPoints(points);
+                if (mesh.geometry) mesh.geometry.dispose();
+                mesh.geometry = geom;
+            }
+
+            let data = planesDataRef.current.get(plane);
+            if (!data) {
               planesDataRef.current.set(plane, {
                 id: planeIdCounter++,
                 orientation,
                 semanticLabel: plane.semanticLabel,
                 color: color,
-                polygon: [],
-                position: {x: 0, y: 0, z: 0},
-                quaternion: {x: 0, y: 0, z: 0, w: 1}
+                polygon: poly,
+                position: {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z},
+                quaternion: {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w},
+                lastSeen: Date.now()
               });
               setActivePlanesCount(planesMap.size);
             }
@@ -230,6 +387,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
           if (removedPlane) setActivePlanesCount(planesMap.size);
         }
       }
+
       renderer.render(scene, camera);
     };
 
@@ -314,14 +472,31 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
 
   const handleFinish = () => {
       const planesArray = Array.from(planesDataRef.current.values());
-      onComplete(planesArray);
+      const lighting = engineApiRef.current?.getCurrentLighting();
+      onComplete(planesArray, 1.0, lighting);
+  };
+
+  const getQualityColor = () => {
+     if (scanQuality === 'low') return 'text-red-400 border-red-500/50 bg-red-500/20 shadow-[0_0_30px_-5px_rgba(239,68,68,0.3)]';
+     if (scanQuality === 'medium') return 'text-yellow-400 border-yellow-500/50 bg-yellow-500/20 shadow-[0_0_30px_-5px_rgba(234,179,8,0.3)]';
+     return 'text-emerald-400 border-emerald-500/50 bg-emerald-500/20 shadow-[0_0_30px_-5px_rgba(16,185,129,0.3)]';
   };
 
   return (
     <>
-      <div ref={containerRef} className="absolute inset-0 bg-black touch-none" />
-      <div id="ar-overlay" className="absolute inset-0 pointer-events-none z-50 flex flex-col justify-between p-6">
-        <div className="flex justify-between items-start">
+      <div ref={containerRef} className="fixed inset-0 w-full h-[100dvh] touch-none" />
+      <div 
+        id="ar-overlay" 
+        className="fixed inset-0 pointer-events-none z-50"
+      >
+        <div 
+          className="w-full h-full flex flex-col justify-between p-6 overflow-hidden box-border"
+          style={{ 
+            paddingTop: 'calc(env(safe-area-inset-top, 24px) + 1.5rem)',
+            paddingBottom: 'calc(env(safe-area-inset-bottom, 24px) + 1.5rem)'
+          }}
+        >
+          <div className="flex justify-between items-start z-10 w-full">
            <div className="space-y-4 pointer-events-auto">
              <Button
                onClick={handleStartSession}
@@ -349,17 +524,55 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
            </div>
 
            {activePlanesCount > 0 && (
-             <Button onClick={handleFinish} className="bg-indigo-600 hover:bg-indigo-500 text-white pointer-events-auto rounded-full px-6 shadow-[0_0_20px_-5px_rgba(79,70,229,1)] flex items-center gap-2">
-                 <Check className="w-5 h-5" />
-                 Finish Mapping
-             </Button>
+             <div className="flex flex-col gap-4 items-end pointer-events-auto">
+               <Button onClick={handleFinish} className="bg-indigo-600 hover:bg-indigo-500 text-white rounded-full px-6 shadow-[0_0_20px_-5px_rgba(79,70,229,1)] flex items-center gap-2">
+                   <Check className="w-5 h-5" />
+                   Finish Mapping
+               </Button>
+               {liveRoomModel && (
+                 <MiniMap roomModel={liveRoomModel} className="w-32 h-32 md:w-48 md:h-48 border border-white/20 shadow-2xl" />
+               )}
+             </div>
            )}
         </div>
-        <div className="text-center pb-8 pointer-events-none">
-            <p className="bg-black/60 inline-flex items-center gap-2 px-4 py-3 rounded-full text-white text-sm backdrop-blur font-medium border border-white/10">
-                <Info className="w-5 h-5 text-indigo-400" />
-                Slowly pan device around the room to map walls & floor
-            </p>
+
+        {/* Central Guidance UI */}
+        {isSupported && (
+           <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none opacity-80 backdrop-blur-sm bg-black/10 transition-opacity duration-500">
+              <div className={`p-6 rounded-full border mb-6 transition-all duration-1000 ${getQualityColor()}`}>
+                 {guidanceIcon}
+              </div>
+           </div>
+        )}
+
+         <div className="text-center pb-8 pointer-events-none z-10 space-y-4">
+            {isSupported === null && (
+               <Button 
+                  onClick={() => {
+                     if ((window as any)._startAR) (window as any)._startAR();
+                  }}
+                  className="bg-indigo-600 hover:bg-indigo-500 text-white pointer-events-auto shadow-lg px-8 py-6 rounded-full font-bold text-lg"
+               >
+                 Tap to Open Camera
+               </Button>
+            )}
+            {isSupported === false ? (
+               <p className="bg-red-500/80 inline-flex flex-col items-center gap-2 px-4 py-3 rounded-xl text-white text-sm backdrop-blur font-medium border border-red-400/50 max-w-sm pointer-events-auto">
+                   <span className="flex items-center gap-2">
+                       <Info className="w-5 h-5 flex-shrink-0" />
+                       WebXR AR session failed to start.
+                   </span>
+                   <span className="text-red-200 text-xs text-center">
+                       If you are in a preview window, please open the app in a new tab. Otherwise, check your site permissions.
+                   </span>
+               </p>
+            ) : isSupported === true ? (
+                <p className={`inline-flex items-center gap-2 px-6 py-4 rounded-full text-white text-sm md:text-base backdrop-blur font-medium border transition-all duration-500 ${scanQuality === 'high' ? 'bg-emerald-500/20 border-emerald-500/30' : 'bg-black/60 border-white/10'}`}>
+                    {scanQuality === 'high' ? <Check className="w-5 h-5 text-emerald-400" /> : <Info className="w-5 h-5 text-indigo-400" />}
+                    {guidanceTip}
+                </p>
+            ) : null}
+         </div>
         </div>
       </div>
     </>
