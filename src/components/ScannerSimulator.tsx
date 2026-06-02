@@ -128,18 +128,23 @@ export function ScannerSimulator({ onComplete, onCancel }: { onComplete: (planes
           mesh.position.set(plane.position.x, plane.position.y, plane.position.z);
           mesh.quaternion.set(plane.quaternion.x, plane.quaternion.y, plane.quaternion.z, plane.quaternion.w);
           
+          const shape = new THREE.Shape();
           const points: THREE.Vector3[] = [];
           for (let i = 0; i < plane.polygon.length; i++) {
               const p = plane.polygon[i];
+              if (i === 0) shape.moveTo(p.x, -p.z);
+              else shape.lineTo(p.x, -p.z);
               points.push(new THREE.Vector3(p.x, 0, -p.z));
           }
-          const geom = new THREE.BufferGeometry().setFromPoints(points);
+          const geom = new THREE.ShapeGeometry(shape);
+          geom.rotateX(-Math.PI / 2);
           mesh.geometry = geom;
           solidMesh.geometry = geom;
           
           // Wireframe
+          const lineGeom = new THREE.BufferGeometry().setFromPoints(points);
           const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
-          const line = new THREE.LineLoop(geom, lineMat);
+          const line = new THREE.LineLoop(lineGeom, lineMat);
           mesh.add(line);
 
           setActivePlanesCount(planesDataRef.current.size);

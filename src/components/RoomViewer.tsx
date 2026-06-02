@@ -1,226 +1,96 @@
-import React, { useMemo, useState, useRef } from 'react';
-import { Canvas } from '@react-three/fiber';
-import { OrbitControls } from '@react-three/drei';
+import React, { useMemo, useState, useRef, useEffect } from 'react';
 import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { OBJExporter } from 'three/examples/jsm/exporters/OBJExporter.js';
 import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js';
 import { PLYExporter } from 'three/examples/jsm/exporters/PLYExporter.js';
 import { ScannedPlane } from './ARScanner';
 import { Button } from './ui/button';
-import { ArrowLeft, Layers, Box, Paintbrush, Camera, Download, Map, Sparkles } from 'lucide-react';
+import { ArrowLeft, Layers, Box, Paintbrush, Download, Map, Sparkles } from 'lucide-react';
 import { RoomReconstruction } from '../core/processing/RoomReconstruction';
 import { RawPlane, RoomLighting } from '../core/models/types';
 import { AIDesignInsights } from './AIDesignInsights';
 
 const MATERIAL_PRESETS = {
-  defaultFloor: { color: 0xffffff, roughness: 0.1, metalness: 0.0, clearcoat: 0.5 },
-  defaultWall: { color: 0x3b82f6, roughness: 0.2, metalness: 0.1, clearcoat: 0.0 },
-  wood: { color: '#8b5a2b', roughness: 0.8, metalness: 0.1, clearcoat: 0.1 },
-  metal: { color: '#b0c4de', roughness: 0.2, metalness: 0.9, clearcoat: 0.5 },
-  fabric: { color: '#f0e6d2', roughness: 1.0, metalness: 0.0, clearcoat: 0.0 },
-  paint: { color: '#f8f9fa', roughness: 0.9, metalness: 0.0, clearcoat: 0.0 }
+  defaultFloor: { color: 0xe2e8f0, roughness: 0.2, metalness: 0.05, clearcoat: 0.3 },
+  defaultWall: { color: 0x3b82f6, roughness: 0.4, metalness: 0.1, clearcoat: 0.0 },
+  wood: { color: 0x8b5a2b, roughness: 0.7, metalness: 0.1, clearcoat: 0.2 },
+  metal: { color: 0xb0c4de, roughness: 0.1, metalness: 0.9, clearcoat: 0.6 },
+  fabric: { color: 0xf0e6d2, roughness: 0.95, metalness: 0.0, clearcoat: 0.0 },
+  paint: { color: 0xf8f9fa, roughness: 0.85, metalness: 0.0, clearcoat: 0.0 }
 };
 
 type MaterialType = keyof typeof MATERIAL_PRESETS;
 
-function WallMesh({ w, isSelected, matProps, map, onClick }: { w: import('../core/models/types').ProcessedWall, isSelected: boolean, matProps: any, map: THREE.Texture | null, onClick: (e: any) => void }) {
-    const geometry = useMemo(() => {
-        const shape = new THREE.Shape();
-        shape.moveTo(-w.width / 2, -w.height / 2);
-        shape.lineTo(w.width / 2, -w.height / 2);
-        shape.lineTo(w.width / 2, w.height / 2);
-        shape.lineTo(-w.width / 2, w.height / 2);
-        shape.lineTo(-w.width / 2, -w.height / 2);
-
-        if (w.holes && w.holes.length > 0) {
-            w.holes.forEach(hole => {
-                const hPath = new THREE.Path();
-                const hx = hole.x - hole.width / 2;
-                const hy = hole.y - hole.height / 2;
-                hPath.moveTo(hx, hy);
-                hPath.lineTo(hx, hy + hole.height);
-                hPath.lineTo(hx + hole.width, hy + hole.height);
-                hPath.lineTo(hx + hole.width, hy);
-                hPath.lineTo(hx, hy);
-                shape.holes.push(hPath);
-            });
-        }
-        
-        // Extrude to give walls architectural thickness
-        const extrudeSettings = {
-            depth: 0.1, // 10cm thick
-            bevelEnabled: false
-        };
-        let geom;
-        try {
-            geom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-        } catch(e) {
-            console.warn("Wall extrusion failed", e);
-            geom = new THREE.PlaneGeometry(w.width, w.height);
-        }
-        // Center the extrusion so the original plane is in the middle or outer face
-        geom.translate(0, 0, -0.05);
-
-        // Fix UV maps for ExtrudeGeometry on walls
-        const posAttribute = geom.attributes.position;
-        const uvAttribute = geom.attributes.uv;
-        for (let i = 0; i < posAttribute.count; i++) {
-           const x = posAttribute.getX(i);
-           const y = posAttribute.getY(i);
-           uvAttribute.setXY(i, x, y);
-        }
-        
-        return geom;
-    }, [w]);
-
-    return (
-        <group position={w.position} quaternion={w.quaternion}>
-           <mesh onClick={onClick}>
-              <primitive object={geometry} attach="geometry" />
-              <meshPhysicalMaterial 
-                   {...matProps} 
-                   map={map}
-                   side={THREE.DoubleSide} 
-                   transparent={false} 
-                   opacity={1} 
-                   emissive={isSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
-              />
-              <lineSegments>
-                <edgesGeometry args={[geometry]} />
-                <lineBasicMaterial color={isSelected ? '#fff' : '#000000'} linewidth={2} opacity={0.6} transparent />
-              </lineSegments>
-           </mesh>
-           
-           {/* Render coplanar features */}
-           {w.holes && w.holes.map((hole, i) => (
-                <group key={i} position={[hole.x, hole.y, 0]}>
-                   <mesh position={[0, 0, 0]}>
-                      <planeGeometry args={[hole.width, hole.height]} />
-                      <meshBasicMaterial 
-                           color={hole.type === 'door' ? '#8b5cf6' : '#38bdf8'} 
-                           transparent 
-                           opacity={0.4} 
-                           side={THREE.DoubleSide} 
-                      />
-                      <lineSegments>
-                         <edgesGeometry args={[new THREE.PlaneGeometry(hole.width, hole.height)]} />
-                         <lineBasicMaterial color={hole.type === 'door' ? '#8b5cf6' : '#38bdf8'} linewidth={2} />
-                      </lineSegments>
-                   </mesh>
-                </group>
-           ))}
-
-           {/* Wall length display */}
-
-        </group>
-    );
-}
-
 export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[], lighting?: RoomLighting, onBack: () => void }) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const [viewMode, setViewMode] = useState<'raw' | 'enhanced' | 'layout2d'>('enhanced');
   const [selectedMeshId, setSelectedMeshId] = useState<string | null>(null);
   const [customMaterials, setCustomMaterials] = useState<Record<string, MaterialType>>({});
   const [showAIInsights, setShowAIInsights] = useState(false);
-  const sceneGroupRef = useRef<THREE.Group>(null);
+  const sceneGroupRef = useRef<THREE.Group | null>(null);
 
+  // Textures generator
   const tileTexture = useMemo(() => {
-     const canvas = document.createElement('canvas');
-     canvas.width = 1024;
-     canvas.height = 1024;
-     const ctx = canvas.getContext('2d');
-     if (ctx) {
-         // Grout lines
-         ctx.fillStyle = '#94a3b8'; 
-         ctx.fillRect(0, 0, 1024, 1024);
-         
-         // Tile inner base
-         ctx.fillStyle = '#f8fafc';
-         ctx.fillRect(16, 16, 992, 992);
-         
-         // Subtle shadow / bevel gradient
-         const gradient = ctx.createLinearGradient(16, 16, 1008, 1008);
-         gradient.addColorStop(0, 'rgba(255, 255, 255, 0.9)');
-         gradient.addColorStop(1, 'rgba(0, 0, 0, 0.08)');
-         ctx.fillStyle = gradient;
-         ctx.fillRect(16, 16, 992, 992);
-
-         // Add some noise for realism
-         const imgData = ctx.getImageData(16, 16, 992, 992);
-         for (let i = 0; i < imgData.data.length; i += 4) {
-             const noise = (Math.random() - 0.5) * 10;
-             imgData.data[i] += noise;
-             imgData.data[i+1] += noise;
-             imgData.data[i+2] += noise;
-         }
-         ctx.putImageData(imgData, 16, 16);
-     }
-     const texture = new THREE.CanvasTexture(canvas);
-     texture.wrapS = THREE.RepeatWrapping;
-     texture.wrapT = THREE.RepeatWrapping;
-     texture.colorSpace = THREE.SRGBColorSpace;
-     // 1 unit = 1m. 2 tiles per meter => set repeat to 2
-     texture.repeat.set(2, 2);
-     // Enable anisotropic filtering for better viewing angle clarity
-     texture.anisotropy = 16;
-     return texture;
-  }, []);
-
-  const woodTexture = useMemo(() => {
-     const canvas = document.createElement('canvas');
-     canvas.width = 1024;
-     canvas.height = 1024;
-     const ctx = canvas.getContext('2d');
-     if (ctx) {
-         // Base wood color
-         ctx.fillStyle = '#b5835a';
-         ctx.fillRect(0, 0, 1024, 1024);
-         
-         // Wood grains
-         ctx.fillStyle = 'rgba(0, 0, 0, 0.03)';
-         for (let i = 0; i < 2000; i++) {
-             ctx.fillRect(Math.random() * 1024, Math.random() * 1024, Math.random() * 200 + 50, 4);
-         }
-         
-         // Planks
-         ctx.strokeStyle = '#5c4033';
-         ctx.lineWidth = 6;
-         for (let y = 0; y < 1024; y += 128) {
-             ctx.beginPath();
-             ctx.moveTo(0, y);
-             ctx.lineTo(1024, y);
-             ctx.stroke();
-             // Vertical plank breaks
-             for (let j = 0; j < 3; j++) {
-                const bx = (Math.random() * 1024);
-                ctx.beginPath();
-                ctx.moveTo(bx, y);
-                ctx.lineTo(bx, y + 128);
-                ctx.stroke();
-             }
-         }
-     }
-     const texture = new THREE.CanvasTexture(canvas);
-     texture.wrapS = THREE.RepeatWrapping;
-     texture.wrapT = THREE.RepeatWrapping;
-     texture.colorSpace = THREE.SRGBColorSpace;
-     // 1 plank is 0.125 units wide. 
-     texture.repeat.set(1, 1);
-     texture.anisotropy = 16;
-     return texture;
-  }, []);
-
-  const plasterTexture = useMemo(() => {
      const canvas = document.createElement('canvas');
      canvas.width = 512;
      canvas.height = 512;
      const ctx = canvas.getContext('2d');
      if (ctx) {
-         ctx.fillStyle = '#f1f5f9';
+         ctx.fillStyle = '#cbd5e1'; 
          ctx.fillRect(0, 0, 512, 512);
-         const imgData = ctx.getImageData(0, 0, 512, 512);
+         ctx.fillStyle = '#f8fafc';
+         ctx.fillRect(8, 8, 496, 496);
+     }
+     const texture = new THREE.CanvasTexture(canvas);
+     texture.wrapS = THREE.RepeatWrapping;
+     texture.wrapT = THREE.RepeatWrapping;
+     texture.colorSpace = THREE.SRGBColorSpace;
+     texture.repeat.set(4, 4);
+     return texture;
+  }, []);
+
+  const woodTexture = useMemo(() => {
+     const canvas = document.createElement('canvas');
+     canvas.width = 512;
+     canvas.height = 512;
+     const ctx = canvas.getContext('2d');
+     if (ctx) {
+         ctx.fillStyle = '#b5835a';
+         ctx.fillRect(0, 0, 512, 512);
+         ctx.fillStyle = 'rgba(0, 0, 0, 0.03)';
+         for (let i = 0; i < 500; i++) {
+             ctx.fillRect(Math.random() * 512, Math.random() * 512, Math.random() * 100 + 30, 2);
+         }
+         ctx.strokeStyle = '#5c4033';
+         ctx.lineWidth = 3;
+         for (let y = 0; y < 512; y += 64) {
+             ctx.beginPath();
+             ctx.moveTo(0, y);
+             ctx.lineTo(512, y);
+             ctx.stroke();
+         }
+     }
+     const texture = new THREE.CanvasTexture(canvas);
+     texture.wrapS = THREE.RepeatWrapping;
+     texture.wrapT = THREE.RepeatWrapping;
+     texture.colorSpace = THREE.SRGBColorSpace;
+     texture.repeat.set(2, 2);
+     return texture;
+  }, []);
+
+  const plasterTexture = useMemo(() => {
+     const canvas = document.createElement('canvas');
+     canvas.width = 256;
+     canvas.height = 256;
+     const ctx = canvas.getContext('2d');
+     if (ctx) {
+         ctx.fillStyle = '#f1f5f9';
+         ctx.fillRect(0, 0, 256, 256);
+         const imgData = ctx.getImageData(0, 0, 256, 256);
          for (let i = 0; i < imgData.data.length; i += 4) {
-             const noise = (Math.random() - 0.5) * 15;
+             const noise = (Math.random() - 0.5) * 8;
              imgData.data[i] = Math.min(255, Math.max(0, imgData.data[i] + noise));
              imgData.data[i+1] = Math.min(255, Math.max(0, imgData.data[i+1] + noise));
              imgData.data[i+2] = Math.min(255, Math.max(0, imgData.data[i+2] + noise));
@@ -232,7 +102,6 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
      texture.wrapT = THREE.RepeatWrapping;
      texture.colorSpace = THREE.SRGBColorSpace;
      texture.repeat.set(4, 4);
-     texture.anisotropy = 16;
      return texture;
   }, []);
 
@@ -243,6 +112,403 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
       return null;
   };
 
+  const modelData = useMemo(() => {
+    const rawPlanes: RawPlane[] = planes.map(p => ({
+        ...p,
+        polygon: p.polygon,
+        position: new THREE.Vector3(p.position.x, p.position.y, p.position.z),
+        quaternion: new THREE.Quaternion(p.quaternion.x, p.quaternion.y, p.quaternion.z, p.quaternion.w)
+    }));
+
+    const model = RoomReconstruction.buildRoomModel(rawPlanes);
+
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    model.floorHullPoints.forEach(p => {
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minZ = Math.min(minZ, p.z);
+        maxZ = Math.max(maxZ, p.z);
+    });
+
+    return { 
+        enhancedWalls: model.enhancedWalls, 
+        features: model.features,
+        objects: model.objects,
+        floorHullPoints: model.floorHullPoints,
+        floorY: model.floorY, 
+        ceilingY: model.ceilingY,
+        roomCenter: model.roomCenter,
+        minX: minX === Infinity ? -2 : minX,
+        maxX: maxX === -Infinity ? 2 : maxX,
+        minZ: minZ === Infinity ? -2 : minZ,
+        maxZ: maxZ === -Infinity ? 2 : maxZ
+    };
+  }, [planes]);
+
+  const { minX, maxX, minZ, maxZ, floorHullPoints, enhancedWalls, features, objects, ceilingY, floorY, roomCenter } = modelData;
+
+  // Render standard manual loop
+  useEffect(() => {
+    if (viewMode === 'layout2d') return;
+    if (!containerRef.current) return;
+    const container = containerRef.current;
+
+    // SCENE & CAMERA Setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0f172a);
+    sceneGroupRef.current = new THREE.Group();
+    scene.add(sceneGroupRef.current);
+
+    const camera = new THREE.PerspectiveCamera(65, container.clientWidth / container.clientHeight, 0.1, 100);
+    camera.position.set(roomCenter[0], (ceilingY + floorY) / 2 + 1.5, roomCenter[2] + 4.5);
+
+    // LIGHTING System
+    const ambientLight = new THREE.AmbientLight(
+        lighting?.ambientColor ? new THREE.Color(lighting.ambientColor) : 0xffffff,
+        lighting?.ambientIntensity ?? 0.6
+    );
+    scene.add(ambientLight);
+
+    const mainLightVec = lighting?.primaryLightDirection ? 
+        new THREE.Vector3(lighting.primaryLightDirection[0], lighting.primaryLightDirection[1], lighting.primaryLightDirection[2]).normalize() :
+        new THREE.Vector3(1, 1.5, 1).normalize();
+
+    const mainLight = new THREE.DirectionalLight(
+        lighting?.primaryLightColor ? new THREE.Color(lighting.primaryLightColor) : 0xffffff,
+        lighting?.primaryLightIntensity ?? 1.5
+    );
+    mainLight.position.copy(mainLightVec).multiplyScalar(10);
+    mainLight.castShadow = true;
+    scene.add(mainLight);
+
+    const fillLight = new THREE.DirectionalLight(0xa3b8cc, 0.4);
+    fillLight.position.set(-8, 5, -8);
+    scene.add(fillLight);
+
+    // RENDERER Setup
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(renderer.domElement);
+
+    // CONTROLS setup
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(roomCenter[0], (ceilingY + floorY) / 2, roomCenter[2]);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.maxPolarAngle = Math.PI / 2 + 0.1;
+
+    // List of clickable elements
+    const raycastableMeshes: THREE.Object3D[] = [];
+
+    // --- RENDER SCENARIOS ---
+    if (viewMode === 'raw') {
+        // Raw Scan Geometry
+        planes.forEach((plane, idx) => {
+            const shape = new THREE.Shape();
+            plane.polygon.forEach((p, i) => {
+                if (i === 0) shape.moveTo(p.x, -p.z);
+                else shape.lineTo(p.x, -p.z);
+            });
+            const geom = new THREE.ShapeGeometry(shape);
+            geom.rotateX(-Math.PI / 2);
+
+            const mat = new THREE.MeshPhysicalMaterial({
+                color: plane.color,
+                side: THREE.DoubleSide,
+                roughness: 0.3,
+                metalness: 0.1,
+                transparent: true,
+                opacity: 0.8
+            });
+
+            const mesh = new THREE.Mesh(geom, mat);
+            mesh.position.set(plane.position.x, plane.position.y, plane.position.z);
+            mesh.quaternion.set(plane.quaternion.x, plane.quaternion.y, plane.quaternion.z, plane.quaternion.w);
+            sceneGroupRef.current?.add(mesh);
+
+            // Outlines
+            const edges = new THREE.EdgesGeometry(geom);
+            const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            const lines = new THREE.LineSegments(edges, lineMat);
+            mesh.add(lines);
+        });
+    } else if (viewMode === 'enhanced') {
+        // Floor Build
+        if (floorHullPoints.length >= 3) {
+            const floorShape = new THREE.Shape();
+            floorHullPoints.forEach((p, i) => {
+                if (i === 0) floorShape.moveTo(p.x, -p.z);
+                else floorShape.lineTo(p.x, -p.z);
+            });
+
+            const extrudeSettings = { depth: 0.1, bevelEnabled: false };
+            let floorGeom: THREE.BufferGeometry;
+            try {
+                floorGeom = new THREE.ExtrudeGeometry(floorShape, extrudeSettings);
+                floorGeom.translate(0, 0, -0.05);
+                floorGeom.rotateX(-Math.PI / 2);
+                floorGeom.translate(0, -0.05, 0);
+            } catch (e) {
+                floorGeom = new THREE.PlaneGeometry(maxX - minX || 5, maxZ - minZ || 5);
+                floorGeom.rotateX(-Math.PI / 2);
+            }
+
+            const floorMatType = customMaterials['floor'] || 'defaultFloor';
+            const floorMatProps = MATERIAL_PRESETS[floorMatType];
+            const isSelected = selectedMeshId === 'floor';
+
+            const floorMaterial = new THREE.MeshPhysicalMaterial({
+                color: isSelected ? 0x94a3b8 : floorMatProps.color,
+                roughness: floorMatProps.roughness,
+                metalness: floorMatProps.metalness,
+                clearcoat: floorMatProps.clearcoat,
+                map: getMaterialMap(floorMatType),
+                side: THREE.DoubleSide
+            });
+
+            const floorMesh = new THREE.Mesh(floorGeom, floorMaterial);
+            floorMesh.position.y = floorY;
+            floorMesh.userData = { id: 'floor', type: 'floor' };
+            sceneGroupRef.current?.add(floorMesh);
+            raycastableMeshes.push(floorMesh);
+
+            // Floor border/edges
+            const floorEdges = new THREE.EdgesGeometry(floorGeom);
+            const floorLine = new THREE.LineSegments(floorEdges, new THREE.LineBasicMaterial({ color: isSelected ? 0xffffff : 0x000000, linewidth: 2 }));
+            floorMesh.add(floorLine);
+
+            // Ceiling build
+            let ceilGeom: THREE.BufferGeometry;
+            try {
+                ceilGeom = new THREE.ExtrudeGeometry(floorShape, extrudeSettings);
+                ceilGeom.translate(0, 0, -0.05);
+                ceilGeom.rotateX(-Math.PI / 2);
+                ceilGeom.translate(0, 0.05, 0);
+            } catch (e) {
+                ceilGeom = new THREE.PlaneGeometry(maxX - minX || 5, maxZ - minZ || 5);
+                ceilGeom.rotateX(-Math.PI / 2);
+            }
+
+            const ceilMaterial = new THREE.MeshPhysicalMaterial({
+                color: 0xf8fafc,
+                roughness: 0.9,
+                metalness: 0.0,
+                map: plasterTexture,
+                side: THREE.DoubleSide
+            });
+            const ceilMesh = new THREE.Mesh(ceilGeom, ceilMaterial);
+            ceilMesh.position.y = ceilingY;
+            sceneGroupRef.current?.add(ceilMesh);
+        }
+
+        // Walls Build
+        enhancedWalls.forEach(w => {
+            const shape = new THREE.Shape();
+            shape.moveTo(-w.width / 2, -w.height / 2);
+            shape.lineTo(w.width / 2, -w.height / 2);
+            shape.lineTo(w.width / 2, w.height / 2);
+            shape.lineTo(-w.width / 2, w.height / 2);
+            shape.lineTo(-w.width / 2, -w.height / 2);
+
+            if (w.holes && w.holes.length > 0) {
+                w.holes.forEach(hole => {
+                    const hPath = new THREE.Path();
+                    const hx = hole.x - hole.width / 2;
+                    const hy = hole.y - hole.height / 2;
+                    hPath.moveTo(hx, hy);
+                    hPath.lineTo(hx, hy + hole.height);
+                    hPath.lineTo(hx + hole.width, hy + hole.height);
+                    hPath.lineTo(hx + hole.width, hy);
+                    hPath.lineTo(hx, hy);
+                    shape.holes.push(hPath);
+                });
+            }
+
+            const extrudeSettings = { depth: 0.1, bevelEnabled: false };
+            let wallGeom: THREE.BufferGeometry;
+            try {
+                wallGeom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+            } catch (e) {
+                wallGeom = new THREE.PlaneGeometry(w.width, w.height);
+            }
+            wallGeom.translate(0, 0, -0.05);
+
+            // Correct UV maps for physical walls
+            const posAttr = wallGeom.attributes.position;
+            const uvAttr = wallGeom.attributes.uv;
+            if (posAttr && uvAttr) {
+                for (let i = 0; i < posAttr.count; i++) {
+                   const x = posAttr.getX(i);
+                   const y = posAttr.getY(i);
+                   uvAttr.setXY(i, x, y);
+                }
+            }
+
+            const wMatType = customMaterials[w.id] || 'defaultWall';
+            const wMatProps = MATERIAL_PRESETS[wMatType];
+            const isSelected = selectedMeshId === w.id;
+
+            const wallMaterial = new THREE.MeshPhysicalMaterial({
+                color: isSelected ? 0x94a3b8 : wMatProps.color,
+                roughness: wMatProps.roughness,
+                metalness: wMatProps.metalness,
+                clearcoat: wMatProps.clearcoat,
+                map: getMaterialMap(wMatType),
+                side: THREE.DoubleSide
+            });
+
+            const wallGroup = new THREE.Group();
+            wallGroup.position.set(w.position[0], w.position[1], w.position[2]);
+            wallGroup.quaternion.set(w.quaternion[0], w.quaternion[1], w.quaternion[2], w.quaternion[3]);
+
+            const wallMesh = new THREE.Mesh(wallGeom, wallMaterial);
+            wallMesh.userData = { id: w.id, type: 'wall' };
+            wallGroup.add(wallMesh);
+            raycastableMeshes.push(wallMesh);
+
+            // Wall outer borders
+            const wallEdges = new THREE.EdgesGeometry(wallGeom);
+            const wallEdgesLine = new THREE.LineSegments(wallEdges, new THREE.LineBasicMaterial({ color: isSelected ? 0xffffff : 0x000000, linewidth: 2 }));
+            wallMesh.add(wallEdgesLine);
+
+            // Add windows/doors panels inside wall relative frames
+            if (w.holes && w.holes.length > 0) {
+                w.holes.forEach(hole => {
+                    const holeGeom = new THREE.PlaneGeometry(hole.width, hole.height);
+                    const holeMat = new THREE.MeshBasicMaterial({
+                        color: hole.type === 'door' ? 0x8b5cf6 : 0x38bdf8,
+                        transparent: true,
+                        opacity: 0.4,
+                        side: THREE.DoubleSide
+                    });
+                    const hMesh = new THREE.Mesh(holeGeom, holeMat);
+                    hMesh.position.set(hole.x, hole.y, 0);
+                    wallGroup.add(hMesh);
+
+                    const hEdges = new THREE.EdgesGeometry(holeGeom);
+                    const hLine = new THREE.LineSegments(hEdges, new THREE.LineBasicMaterial({ color: hole.type === 'door' ? 0x8b5cf6 : 0x38bdf8, linewidth: 2 }));
+                    hMesh.add(hLine);
+                });
+            }
+
+            sceneGroupRef.current?.add(wallGroup);
+        });
+
+        // Furniture/Objects placements
+        if (objects) {
+            objects.forEach(o => {
+                let color = 0xf59e0b;
+                if (o.type === 'chair') color = 0xf43f5e;
+                if (o.type === 'sofa') color = 0xd946ef;
+                if (o.type === 'wardrobe') color = 0xf97316;
+                if (o.type === 'tv') color = 0x14b8a6;
+
+                const geom = new THREE.BoxGeometry(o.width, o.height, o.depth);
+                const isSelected = selectedMeshId === o.id;
+
+                const mat = new THREE.MeshPhysicalMaterial({
+                    color: isSelected ? 0x94a3b8 : color,
+                    transparent: true,
+                    opacity: 0.7,
+                    roughness: 0.5,
+                    metalness: 0.1
+                });
+
+                const mesh = new THREE.Mesh(geom, mat);
+                mesh.position.set(o.position[0], o.position[1], o.position[2]);
+                mesh.quaternion.set(o.quaternion[0], o.quaternion[1], o.quaternion[2], o.quaternion[3]);
+                mesh.userData = { id: o.id, type: 'object' };
+                sceneGroupRef.current?.add(mesh);
+                raycastableMeshes.push(mesh);
+
+                const edges = new THREE.EdgesGeometry(geom);
+                const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: isSelected ? 0xffffff : color, linewidth: 2 }));
+                mesh.add(line);
+            });
+        }
+
+        // Add Metric overlay lines
+        if (maxX !== -Infinity) {
+            const annotationsGroup = new THREE.Group();
+            sceneGroupRef.current?.add(annotationsGroup);
+
+            // Width Line (Orange)
+            const wPts = [new THREE.Vector3(minX, floorY + 0.05, minZ - 0.2), new THREE.Vector3(maxX, floorY + 0.05, minZ - 0.2)];
+            const wGeom = new THREE.BufferGeometry().setFromPoints(wPts);
+            const wLine = new THREE.Line(wGeom, new THREE.LineBasicMaterial({ color: 0xf59e0b, linewidth: 3 }));
+            annotationsGroup.add(wLine);
+
+            // Length Line (Green)
+            const lPts = [new THREE.Vector3(minX - 0.2, floorY + 0.05, minZ), new THREE.Vector3(minX - 0.2, floorY + 0.05, maxZ)];
+            const lGeom = new THREE.BufferGeometry().setFromPoints(lPts);
+            const lLine = new THREE.Line(lGeom, new THREE.LineBasicMaterial({ color: 0x10b981, linewidth: 3 }));
+            annotationsGroup.add(lLine);
+
+            // Height Line (Blue)
+            const hPts = [new THREE.Vector3(maxX + 0.2, floorY, (minZ + maxZ)/2), new THREE.Vector3(maxX + 0.2, ceilingY, (minZ + maxZ)/2)];
+            const hGeom = new THREE.BufferGeometry().setFromPoints(hPts);
+            const hLine = new THREE.Line(hGeom, new THREE.LineBasicMaterial({ color: 0x38bdf8, linewidth: 3 }));
+            annotationsGroup.add(hLine);
+        }
+    }
+
+    // RAYCASTING click logic
+    const handlePointerDown = (event: PointerEvent) => {
+        // Calculate canvas coordinates
+        const rect = renderer.domElement.getBoundingClientRect();
+        const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        const y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(x, y), camera);
+        const intersects = raycaster.intersectObjects(raycastableMeshes);
+
+        if (intersects.length > 0) {
+            const hit = intersects[0].object;
+            if (hit.userData && hit.userData.id) {
+                setSelectedMeshId(hit.userData.id);
+            }
+        } else {
+            // Did not hit any paintable meshes
+            setSelectedMeshId(null);
+        }
+    };
+    renderer.domElement.addEventListener('pointerdown', handlePointerDown);
+
+    // ANIMATION Loop
+    let animationFrameId: number;
+    const animate = () => {
+        animationFrameId = requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    };
+    animate();
+
+    // RESIZE Listener
+    const onWindowResize = () => {
+        camera.aspect = container.clientWidth / container.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(container.clientWidth, container.clientHeight);
+    };
+    window.addEventListener('resize', onWindowResize);
+
+    // CLEANUP
+    return () => {
+        cancelAnimationFrame(animationFrameId);
+        window.removeEventListener('resize', onWindowResize);
+        if (renderer.domElement && renderer.domElement.parentNode) {
+            renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
+            renderer.dispose();
+            container.removeChild(renderer.domElement);
+        }
+        scene.clear();
+    };
+  }, [viewMode, planes, customMaterials, selectedMeshId, roomCenter, ceilingY, floorY, lighting]);
+
+  // Handle high precision exports
   const handleExportGLTF = () => {
       if (!sceneGroupRef.current) return;
       const exporter = new GLTFExporter();
@@ -259,7 +525,7 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
               URL.revokeObjectURL(url);
           },
           (error) => {
-              console.error('An error happened during parsing', error);
+              console.error('GLTF Export Failed', error);
           },
           { binary: false }
       );
@@ -305,115 +571,6 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
       }, { binary: false });
   };
 
-  // Process data for the enhanced view using our separated processing layer
-  const { enhancedWalls, features, objects, floorHullPoints, floorHull, ceilingHull, floorY, ceilingY, roomCenter, minX, maxX, minZ, maxZ } = useMemo(() => {
-    // Map ScannedPlane to RawPlane
-    const rawPlanes: RawPlane[] = planes.map(p => ({
-        ...p,
-        polygon: p.polygon,
-        position: new THREE.Vector3(p.position.x, p.position.y, p.position.z),
-        quaternion: new THREE.Quaternion(p.quaternion.x, p.quaternion.y, p.quaternion.z, p.quaternion.w)
-    }));
-
-    const model = RoomReconstruction.buildRoomModel(rawPlanes);
-
-    // Create THREE.js Display Geometry from Model data
-    const floorShape = new THREE.Shape();
-    const ceilShape = new THREE.Shape();
-    
-    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-
-    model.floorHullPoints.forEach((p, i) => {
-        if (i === 0) {
-            floorShape.moveTo(p.x, -p.z);
-            ceilShape.moveTo(p.x, -p.z);
-        } else {
-            floorShape.lineTo(p.x, -p.z);
-            ceilShape.lineTo(p.x, -p.z);
-        }
-        minX = Math.min(minX, p.x);
-        maxX = Math.max(maxX, p.x);
-        minZ = Math.min(minZ, p.z);
-        maxZ = Math.max(maxZ, p.z);
-    });
-
-    const extrudeSettings = { depth: 0.1, bevelEnabled: false };
-    let fGeom;
-    let cGeom;
-    try {
-        fGeom = new THREE.ExtrudeGeometry(floorShape, extrudeSettings);
-        fGeom.translate(0, 0, -0.05);
-        fGeom.rotateX(-Math.PI / 2);
-        fGeom.translate(0, -0.05, 0); // shift down by half thickness
-        
-        cGeom = new THREE.ExtrudeGeometry(ceilShape, extrudeSettings);
-        cGeom.translate(0, 0, -0.05);
-        cGeom.rotateX(-Math.PI / 2);
-        cGeom.translate(0, 0.05, 0); // shift up by half thickness
-    } catch(err) {
-        console.warn("ExtrudeGeometry failed, degenerate polygon.", err);
-        fGeom = new THREE.PlaneGeometry(maxX - minX || 5, maxZ - minZ || 5);
-        fGeom.rotateX(-Math.PI / 2);
-        cGeom = new THREE.PlaneGeometry(maxX - minX || 5, maxZ - minZ || 5);
-        cGeom.rotateX(-Math.PI / 2);
-    }
-
-    return { 
-        enhancedWalls: model.enhancedWalls, 
-        features: model.features,
-        objects: model.objects,
-        floorHullPoints: model.floorHullPoints,
-        floorHull: fGeom, 
-        ceilingHull: cGeom, 
-        floorY: model.floorY, 
-        ceilingY: model.ceilingY,
-        roomCenter: model.roomCenter,
-        minX, maxX, minZ, maxZ
-    };
-  }, [planes]);
-
-  const rawPlaneMeshes = useMemo(() => {
-    return planes.map(plane => {
-      const shape = new THREE.Shape();
-      for (let i = 0; i < plane.polygon.length; i++) {
-        const p = plane.polygon[i];
-        if (i === 0) shape.moveTo(p.x, -p.z);
-        else shape.lineTo(p.x, -p.z);
-      }
-      const geom = new THREE.ShapeGeometry(shape);
-      geom.rotateX(-Math.PI / 2);
-      
-      return {
-        id: plane.id,
-        geometry: geom,
-        position: [plane.position.x, plane.position.y, plane.position.z] as [number, number, number],
-        quaternion: [plane.quaternion.x, plane.quaternion.y, plane.quaternion.z, plane.quaternion.w] as [number, number, number, number],
-        color: plane.color,
-      };
-    });
-  }, [planes]);
-
-  const enhancedWallGeometries = useMemo(() => {
-    return enhancedWalls.map(w => ({
-      id: w.id,
-      geometry: new THREE.PlaneGeometry(w.width, w.height)
-    }));
-  }, [enhancedWalls]);
-  const enhancedWallGeometryMap = useMemo(() => {
-    return new Map(enhancedWallGeometries.map((wg) => [wg.id, wg.geometry]));
-  }, [enhancedWallGeometries]);
-
-  useEffect(() => {
-    return () => {
-      floorHull.dispose();
-      ceilingHull.dispose();
-      rawPlaneMeshes.forEach((pm) => pm.geometry.dispose());
-      enhancedWallGeometries.forEach((wg) => {
-        wg.geometry.dispose();
-      });
-    };
-  }, [floorHull, ceilingHull, rawPlaneMeshes, enhancedWallGeometries]);
-
   const handleApplyMaterial = (matType: MaterialType) => {
       if (selectedMeshId) {
           setCustomMaterials(prev => ({
@@ -434,7 +591,7 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
             <ArrowLeft className="w-5 h-5 mr-2" />
             Rescan Room
           </Button>
-          <Button variant="default" className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg border-0" onClick={() => setShowAIInsights(true)}>
+          <Button variant="default" className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg border-0 font-semibold" onClick={() => setShowAIInsights(true)}>
             <Sparkles className="w-5 h-5 mr-2" />
             AI Insights
           </Button>
@@ -466,6 +623,7 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
                   <Map className="w-4 h-4 mr-2 hidden sm:block" />
                   2D Layout
                </Button>
+
                <div className="flex gap-0 ml-auto md:ml-2 shadow-lg rounded-md overflow-hidden bg-emerald-600">
                    <Button 
                       variant="ghost"
@@ -473,7 +631,6 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
                       onClick={handleExportGLTF}
                       title="Export GLTF"
                    >
-                      <Download className="w-4 h-4 mr-1 hidden sm:block" />
                       GLTF
                    </Button>
                    <div className="w-[1px] bg-emerald-500 my-2" />
@@ -508,14 +665,15 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
         </div>
 
         <div className="bg-black/50 backdrop-blur rounded-xl p-4 border border-white/10 text-white pointer-events-auto shadow-xl hidden md:block">
-            <h3 className="font-bold text-lg mb-1">3D Room Model</h3>
-            <p className="text-xs text-slate-300 mb-0">({planes.length} surfaces)</p>
+            <h3 className="font-bold text-lg mb-1">Room Viewer</h3>
+            <p className="text-xs text-slate-300 mb-0">Detected {planes.length} surfaces</p>
+            
             {viewMode === 'enhanced' && (
               <div className="mt-3 pt-3 border-t border-white/10">
                 <p className="text-xs text-slate-300 mb-1 flex items-center gap-1">
-                    <Paintbrush className="w-3 h-3" /> Tap to paint
+                    <Paintbrush className="w-3 h-3 text-indigo-400" /> Click wall/floor to apply textures
                 </p>
-                <p className="text-xs text-slate-400">Ceiling: {((ceilingY - floorY) || 0).toFixed(2)}m</p>
+                <p className="text-xs text-slate-400">Ceiling height: {((ceilingY - floorY) || 0).toFixed(2)}m</p>
               </div>
             )}
         </div>
@@ -524,10 +682,10 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
       {/* Material Toolbar */}
       {viewMode === 'enhanced' && selectedMeshId && (
           <div 
-             className="absolute bottom-0 inset-x-0 mx-auto flex justify-center z-10 pointer-events-none px-4"
+             className="absolute bottom-6 inset-x-0 mx-auto flex justify-center z-10 pointer-events-none px-4"
              style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 24px) + 1.5rem)' }}
           >
-              <div className="bg-black/60 backdrop-blur border border-white/10 p-3 rounded-2xl flex flex-wrap justify-center gap-2 pointer-events-auto shadow-2xl max-w-full">
+              <div className="bg-black/70 backdrop-blur border border-white/15 p-3 rounded-2xl flex flex-wrap justify-center gap-2 pointer-events-auto shadow-2xl max-w-full">
                  <Button onClick={() => handleApplyMaterial('wood')} className="bg-[#8b5a2b] hover:bg-[#6b4421] text-white flex-1 min-w-[80px]">Wood</Button>
                  <Button onClick={() => handleApplyMaterial('metal')} className="bg-[#b0c4de] hover:bg-[#90a4be] text-slate-900 border border-slate-400 flex-1 min-w-[80px]">Metal</Button>
                  <Button onClick={() => handleApplyMaterial('fabric')} className="bg-[#f0e6d2] hover:bg-[#d0c6b2] text-slate-900 border border-slate-300 flex-1 min-w-[80px]">Fabric</Button>
@@ -544,17 +702,12 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
           </div>
       )}
 
-      <div className="flex-1 w-full h-full relative cursor-move" onPointerDown={() => {
-          // Deselect if clicking the background in enhanced mode
-          if (viewMode === 'enhanced' && selectedMeshId) {
-             // setSelectedMeshId(null);
-          }
-      }}>
-        {viewMode === 'layout2d' && (
+      <div className="flex-1 w-full h-full relative cursor-move">
+        {viewMode === 'layout2d' ? (
              <div className="absolute inset-0 bg-slate-900 flex items-center justify-center p-8 overflow-hidden touch-pinch-zoom">
                 <svg 
                   viewBox={maxX !== -Infinity ? `${minX - 1} ${minZ - 1} ${maxX - minX + 2} ${maxZ - minZ + 2}` : "0 0 10 10"} 
-                  className="w-full h-full max-w-5xl"
+                  className="w-full h-full max-w-4xl"
                   preserveAspectRatio="xMidYMid meet"
                 >
                    {/* Floor Profile */}
@@ -604,7 +757,7 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
                                     fillOpacity="0.2"
                                     stroke={color}
                                     strokeWidth="0.04"
-                                    rx="0.02" // slightly rounded
+                                    rx="0.02"
                                  />
                                  <g transform={`rotate(${isUpsideDown ? 180 : 0}) translate(0, ${isUpsideDown ? -0.25 : -0.15})`}>
                                     <text x="0" y="0" fontSize="0.12" textAnchor="middle" fill={color} fontWeight="600">
@@ -663,145 +816,14 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
                    )}
                 </svg>
              </div>
-        )}
-        
-        {viewMode !== 'layout2d' && (
-        <Canvas camera={{ position: [0, 2, 4], fov: 100 }}>
-          <color attach="background" args={['#0f172a']} />
-          <ambientLight 
-              intensity={lighting?.ambientIntensity ?? 0.5} 
-              color={lighting?.ambientColor ? new THREE.Color(lighting.ambientColor) : undefined} 
-          />
-          <directionalLight 
-              position={lighting?.primaryLightDirection ? [lighting.primaryLightDirection[0] * 10, lighting.primaryLightDirection[1] * 10, lighting.primaryLightDirection[2] * 10] : [10, 15, 10]} 
-              intensity={lighting ? Math.max(1.0, (lighting.primaryLightIntensity ?? 1.5)) : 1.5} 
-              color={lighting?.primaryLightColor ? new THREE.Color(lighting.primaryLightColor) : "#ffffff"} 
-              castShadow 
-          />
-          <directionalLight position={[-10, 5, -10]} intensity={0.5} color="#a3b8cc" />
-          
-          <group ref={sceneGroupRef}>
-            {viewMode === 'raw' && rawPlaneMeshes.map((pm, idx) => (
-              <mesh key={pm.id} geometry={pm.geometry} position={pm.position} quaternion={pm.quaternion} renderOrder={idx}>
-                <meshPhysicalMaterial color={pm.color} side={THREE.DoubleSide} transparent opacity={0.8} roughness={0.2} metalness={0.1} />
-                <lineSegments>
-                  <edgesGeometry args={[pm.geometry]} />
-                  <lineBasicMaterial color="white" linewidth={3} opacity={0.6} transparent />
-                </lineSegments>
-              </mesh>
-            ))}
-
-            {viewMode === 'enhanced' && (() => {
-                const floorMatProps = customMaterials['floor'] ? MATERIAL_PRESETS[customMaterials['floor']] : MATERIAL_PRESETS.defaultFloor;
-                const isFloorSelected = selectedMeshId === 'floor';
-
-                return (
-                  <>
-                     {/* Floor */}
-                     <mesh 
-                        geometry={floorHull} 
-                        position={[0, floorY, 0]}
-                        onClick={(e) => { e.stopPropagation(); setSelectedMeshId('floor'); }}
-                     >
-                        <meshPhysicalMaterial 
-                            {...floorMatProps} 
-                            side={THREE.DoubleSide} 
-                            transparent={false} 
-                            opacity={1} 
-                            emissive={isFloorSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
-                        />
-                        <lineSegments>
-                          <edgesGeometry args={[floorHull]} />
-                          <lineBasicMaterial color={isFloorSelected ? '#fff' : '#10b981'} linewidth={3} opacity={isFloorSelected ? 1 : 0.6} transparent />
-                        </lineSegments>
-                     </mesh>
-
-                     {/* Ceiling */}
-                     <mesh geometry={ceilingHull} position={[0, ceilingY, 0]}>
-                        <meshPhysicalMaterial color={0x10b981} side={THREE.DoubleSide} transparent opacity={0.1} roughness={0.2} metalness={0.1} />
-                     </mesh>
-
-                     {/* Walls */}
-                     {enhancedWalls.map(w => {
-                        const matProps = customMaterials[w.id] ? MATERIAL_PRESETS[customMaterials[w.id]] : MATERIAL_PRESETS.defaultWall;
-                        const isSelected = selectedMeshId === w.id;
-                        const wallGeometry = enhancedWallGeometryMap.get(w.id);
-                        if (!wallGeometry) return null;
-
-                        return (
-                          <group key={w.id} position={w.position} quaternion={w.quaternion}>
-                            <mesh 
-                                rotation={[-Math.PI / 2, 0, 0]}
-                                onClick={(e) => { e.stopPropagation(); setSelectedMeshId(w.id); }}
-                                geometry={wallGeometry}
-                            >
-                               <meshPhysicalMaterial 
-                                    {...matProps} 
-                                    side={THREE.DoubleSide} 
-                                    transparent={false} 
-                                    opacity={1} 
-                                    emissive={isSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
-                               />
-                               <lineSegments>
-                                 <edgesGeometry args={[wallGeometry]} />
-                                 <lineBasicMaterial color={isSelected ? '#fff' : '#3b82f6'} linewidth={3} opacity={isSelected ? 1 : 0.6} transparent />
-                               </lineSegments>
-                            </mesh>
-                        </group>
-                    );
-                })}
-
-                {/* Overall Dimensions Annotations */}
-                {maxX !== -Infinity && (
-                   <group>
-                      {/* Width annotation (along X) */}
-                      <group position={[(minX + maxX) / 2, floorY + 0.02, minZ - 0.2]}>
-                         <mesh position={[0, 0, 0]}>
-                            <boxGeometry args={[maxX - minX, 0.02, 0.02]} />
-                            <meshBasicMaterial color="#f59e0b" />
-                         </mesh>
-
-                      </group>
-
-                      {/* Length annotation (along Z) */}
-                      <group position={[minX - 0.2, floorY + 0.02, (minZ + maxZ) / 2]}>
-                         <mesh position={[0, 0, 0]}>
-                            <boxGeometry args={[0.02, 0.02, maxZ - minZ]} />
-                            <meshBasicMaterial color="#10b981" />
-                         </mesh>
-
-                      </group>
-
-                      {/* Height annotation */}
-                      <group position={[maxX + 0.2, floorY + (ceilingY - floorY) / 2, (minZ + maxZ) / 2]}>
-                         <mesh position={[0, 0, 0]}>
-                            <boxGeometry args={[0.02, ceilingY - floorY, 0.02]} />
-                            <meshBasicMaterial color="#38bdf8" />
-                         </mesh>
-
-                      </group>
-                   </group>
-                )}
-              </React.Suspense>
-            )}
-          </group>
-
-          {/* @ts-ignore */}
-          <OrbitControls 
-            target={[roomCenter[0], (ceilingY + floorY) / 2 || 0, roomCenter[2]]}
-            makeDefault 
-            autoRotate={false} 
-            maxPolarAngle={Math.PI / 2 + 0.2}
-            enableDamping
-            dampingFactor={0.05}
-          />
-        </Canvas>
+        ) : (
+             <div ref={containerRef} className="w-full h-full text-slate-100" />
         )}
       </div>
       
       {viewMode !== 'layout2d' && (
-      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 pointer-events-none text-slate-400 text-sm tracking-wide bg-black/40 px-6 py-2 rounded-full border border-white/5 backdrop-blur">
-        Drag to rotate • Pinch to zoom
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 pointer-events-none text-slate-400 text-xs tracking-wide bg-black/40 px-6 py-2 rounded-full border border-white/5 backdrop-blur z-10">
+        Drag to rotate • Pinch/Scroll to zoom • Click surface to select
       </div>
       )}
 

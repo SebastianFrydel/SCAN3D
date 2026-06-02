@@ -54,8 +54,6 @@ function App() {
     if ('xr' in navigator) {
       (navigator as any).xr?.isSessionSupported('immersive-ar').then((supported: boolean) => {
         setIsWebXRSupported(supported);
-      }).catch(() => {
-        setIsWebXRSupported(false);
       });
     }
   }, []);

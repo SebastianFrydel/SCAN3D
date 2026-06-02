@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { Check, Info, Scan, X } from 'lucide-react';
+import { Check, Info, X, Map as MapIcon, ArrowDown, ArrowRight, ArrowLeft, RefreshCw, Compass } from 'lucide-react';
 import { Button } from './ui/button';
 import { RoomReconstruction } from '../core/processing/RoomReconstruction';
 import { RoomLighting, RoomModel } from '../core/models/types';
@@ -17,111 +17,169 @@ export interface ScannedPlane {
   lastSeen: number;
 }
 
-const SESSION_START_TIMEOUT_MS = 8000;
+let isWebXRRequesting = false;
 
-type XRSessionLike = {
-  end: () => Promise<void>;
-};
-
-type XRSystemLike = {
-  requestSession?: (mode: 'immersive-ar', options: Record<string, unknown>) => Promise<XRSessionLike>;
-};
-
-const getXRSystem = () => (navigator as Navigator & { xr?: XRSystemLike }).xr;
-
-const clearSessionStartTimer = (timerRef: React.MutableRefObject<number | null>) => {
-  if (timerRef.current) {
-    window.clearTimeout(timerRef.current);
-    timerRef.current = null;
-  }
-};
-
-const getSessionErrorMessage = (error: unknown) => {
-  const name = error instanceof DOMException ? error.name : '';
-
-  if (name === 'NotAllowedError' || name === 'SecurityError') {
-    return 'Camera/AR permission was denied. Please allow camera access and try again.';
-  }
-
-  if (name === 'NotSupportedError') {
-    return 'This browser or device does not support the WebXR plane detection needed for scanning.';
-  }
-
-  return 'Could not start AR. Please try again on a secure HTTPS page with a WebXR-compatible browser.';
-};
-
-const getDetectedPlaneSet = (detectedPlanes: unknown): Set<any> | null => {
-  if (!detectedPlanes) return null;
-  if (detectedPlanes instanceof Set) return detectedPlanes;
-
-  try {
-    return new Set(Array.from(detectedPlanes as Iterable<any>));
-  } catch (error) {
-    console.warn('Ignoring unsupported detectedPlanes payload', error);
-    return null;
-  }
-};
-
-const disposePlaneMesh = (mesh: THREE.Mesh) => {
-  mesh.geometry?.dispose();
-  const material = mesh.material;
-  if (Array.isArray(material)) {
-    material.forEach((item) => item.dispose());
-  } else {
-    material?.dispose();
-  }
-};
-
-export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: ScannedPlane[]) => void, onCancel: () => void }) {
+export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: ScannedPlane[], scaleFactor: number, lighting?: RoomLighting) => void, onCancel: () => void }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [activePlanesCount, setActivePlanesCount] = useState(0);
   const planesDataRef = useRef<Map<any, ScannedPlane>>(new Map());
-  const startRequestedRef = useRef(false);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const sessionRef = useRef<XRSessionLike | null>(null);
-  const sessionStartTimerRef = useRef<number | null>(null);
-  const isMountedRef = useRef(true);
-  const [isSessionStarting, setIsSessionStarting] = useState(false);
-  const [sessionStartError, setSessionStartError] = useState<string | null>(null);
+  const [isSupported, setIsSupported] = useState<boolean | null>(null);
+  const [scanQuality, setScanQuality] = useState<'low' | 'medium' | 'high'>('low');
+  const [scanStats, setScanStats] = useState({ floorArea: 0, wallArea: 0, ceilingArea: 0, featureCount: 0, roomHeight: 0 });
+  const [liveRoomModel, setLiveRoomModel] = useState<RoomModel | null>(null);
+  const [guidanceTip, setGuidanceTip] = useState<string>('Point at floor to start');
+  const [guidanceIcon, setGuidanceIcon] = useState<React.ReactNode>(<ArrowDown className="w-8 h-8 md:w-12 md:h-12" />);
+
+  const engineApiRef = useRef<any>(null);
 
   useEffect(() => {
-    isMountedRef.current = true;
     if (!containerRef.current) return;
     const container = containerRef.current;
     
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
-    const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
-    light.position.set(0.5, 1, 0.25);
-    scene.add(light);
+    let isMounted = true;
+    let renderer: THREE.WebGLRenderer | undefined;
+    let onWindowResize: (() => void) | null = null;
+    let currentSession: any = null;
+    let planesMap = new Map<any, THREE.Mesh>();
+    let scene = new THREE.Scene();
+    
+    try {
+        const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        light.position.set(0.5, 1, 0.25);
+        scene.add(light);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    rendererRef.current = renderer;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.setSize(window.innerWidth, window.innerHeight, false);
+        const wireframeGroup = new THREE.Group();
+        scene.add(wireframeGroup);
+        
+        // Add guidance animations group
+        const guidanceAnimGroup = new THREE.Group();
+        scene.add(guidanceAnimGroup);
+
+        // Create a pulsing circle for the floor
+        const floorCircleGeom = new THREE.RingGeometry(0.3, 0.4, 32);
+        const floorCircleMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.8, side: THREE.DoubleSide });
+        const floorCircle = new THREE.Mesh(floorCircleGeom, floorCircleMat);
+        floorCircle.rotation.x = -Math.PI / 2;
+        floorCircle.visible = false;
+        guidanceAnimGroup.add(floorCircle);
+
+        // Create animated arrows to indicate panning
+        const arrowGeom = new THREE.ConeGeometry(0.05, 0.2, 8);
+        const arrowMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.8 });
+        const movingArrow = new THREE.Mesh(arrowGeom, arrowMat);
+        movingArrow.visible = false;
+        guidanceAnimGroup.add(movingArrow);
+
+    let frameCount = 0;
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.xr.enabled = true;
     // renderer.xr.setFramebufferScaleFactor(window.devicePixelRatio);
     container.appendChild(renderer.domElement);
 
-    const onSessionStart = () => {
-      clearSessionStartTimer(sessionStartTimerRef);
-      startRequestedRef.current = false;
-      if (!isMountedRef.current) return;
-      setIsSessionStarting(false);
-      setSessionStartError(null);
-    };
-    const onSessionEnd = () => {
-      sessionRef.current = null;
-      startRequestedRef.current = false;
-      if (!isMountedRef.current) return;
-      setIsSessionStarting(false);
-    };
-    renderer.xr.addEventListener('sessionstart', onSessionStart);
-    renderer.xr.addEventListener('sessionend', onSessionEnd);
+    const startAR = async () => {
+        if (isWebXRRequesting) {
+            console.warn("WebXR is already requesting a session. Ignoring duplicate request.");
+            return;
+        }
+        
+        const xr = (navigator as any).xr;
+        if (!xr) {
+            if (isMounted) setIsSupported(false);
+            return;
+        }
 
-    const planesMap = new Map<any, THREE.Mesh>();
-    let currentSession: XRSessionLike | null = null;
+        isWebXRRequesting = true;
+
+        try {
+            const supported = await xr.isSessionSupported('immersive-ar');
+            if (!supported) {
+                if (isMounted) setIsSupported(false);
+                isWebXRRequesting = false;
+                return;
+            }
+        } catch (e) {
+            console.warn("isSessionSupported failed:", e);
+            if (isMounted) setIsSupported(false);
+            isWebXRRequesting = false;
+            return;
+        }
+
+        const overlayDiv = document.getElementById('ar-overlay');
+        
+        try {
+            const session = await xr.requestSession('immersive-ar', {
+                requiredFeatures: ['plane-detection'],
+                optionalFeatures: ['dom-overlay', 'local-floor', 'light-estimation', 'camera-access'],
+                domOverlay: overlayDiv ? { root: overlayDiv } : undefined
+            });
+            isWebXRRequesting = false;
+            if (!isMounted) {
+                session.end();
+                return;
+            }
+            renderer.xr.setReferenceSpaceType('local-floor');
+            await renderer.xr.setSession(session);
+            currentSession = session;
+            setIsSupported(true);
+        } catch (err: any) {
+            console.warn("AR Session error (full features):", err);
+            
+            if (err.message?.includes('already an active')) {
+                isWebXRRequesting = false;
+                return;
+            }
+
+            try {
+                // Fallback attempt without plane-detection as required
+                const fallbackSession = await xr.requestSession('immersive-ar', {
+                    optionalFeatures: ['dom-overlay', 'local-floor', 'light-estimation', 'camera-access'],
+                    domOverlay: overlayDiv ? { root: overlayDiv } : undefined
+                });
+                isWebXRRequesting = false;
+                if (!isMounted) {
+                    fallbackSession.end();
+                    return;
+                }
+                renderer.xr.setReferenceSpaceType('local-floor');
+                await renderer.xr.setSession(fallbackSession);
+                currentSession = fallbackSession;
+                setIsSupported(true);
+            } catch (fallbackErr: any) {
+                console.warn("AR Session fallback error with dom-overlay:", fallbackErr);
+                
+                try {
+                    // Final bare minimum fallback
+                    const bareSession = await xr.requestSession('immersive-ar', {
+                        optionalFeatures: ['local-floor', 'light-estimation']
+                    });
+                    isWebXRRequesting = false;
+                    if (!isMounted) {
+                        bareSession.end();
+                        return;
+                    }
+                    renderer.xr.setReferenceSpaceType('local-floor');
+                    await renderer.xr.setSession(bareSession);
+                    currentSession = bareSession;
+                    setIsSupported(true);
+                } catch (bareErr: any) {
+                    isWebXRRequesting = false;
+                    console.warn("AR Session bare fallback error:", bareErr);
+                    if (isMounted) setIsSupported(false);
+                }
+            }
+        }
+    };
+    
+    // We bind it to window so we can trigger it from React state easily without losing closure
+    (window as any)._startAR = startAR;
+    
+    // Try auto-starting if possible (sometimes works if transient activation carried over)
+    startAR().catch(() => {});
+
     let planeIdCounter = 0;
     let planeSupportChecked = false;
     let lastScanTime = Date.now();
@@ -146,19 +204,93 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     };
     window.addEventListener('resize', onWindowResize);
 
-    const planeGeometryVersion = new Map<any, number>();
+    engineApiRef.current = {
+        getCurrentLighting: () => currentLighting
+    };
+
+    const animate = () => {
+      renderer.setAnimationLoop(render);
+    };
+
     const render = (timestamp: number, frame: any) => {
       if (frame) {
-        currentSession = renderer.xr.getSession() as XRSessionLike | null;
-        sessionRef.current = currentSession;
+        currentSession = renderer.xr.getSession();
         const referenceSpace = renderer.xr.getReferenceSpace();
-        if (!referenceSpace) {
-          renderer.render(scene, camera);
-          return;
+
+        // Ensure the camera matches the device pose continuously
+        const viewerPose = frame.getViewerPose(referenceSpace);
+        if (viewerPose && viewerPose.views.length > 0) {
+            const view = viewerPose.views[0];
+            camera.position.set(view.transform.position.x, view.transform.position.y, view.transform.position.z);
+            camera.quaternion.set(view.transform.orientation.x, view.transform.orientation.y, view.transform.orientation.z, view.transform.orientation.w);
+            
+            // Keep the projection matrix synced too
+            camera.projectionMatrix.fromArray(view.projectionMatrix);
         }
 
-        const detectedPlanes = getDetectedPlaneSet(frame.detectedPlanes);
-        if (detectedPlanes) {
+        // Request light probe once
+        if (currentSession && !lightProbeRequested && currentSession.requestLightProbe) {
+            lightProbeRequested = true;
+            currentSession.requestLightProbe({
+               reflectionFormat: currentSession.preferredReflectionFormat
+            }).then((probe: any) => {
+               xrLightProbe = probe;
+            }).catch((err: any) => console.warn("LightProbe failed", err));
+        }
+
+        // Update lighting estimate
+        if (xrLightProbe) {
+            const lightEstimate = frame.getLightEstimate(xrLightProbe);
+            if (lightEstimate) {
+                if (lightEstimate.primaryLightDirection) {
+                    const dir = lightEstimate.primaryLightDirection;
+                    currentLighting.primaryLightDirection = [dir.x, dir.y, dir.z];
+                }
+                if (lightEstimate.primaryLightIntensity) {
+                    const intensity = lightEstimate.primaryLightIntensity;
+                    // Usually an RGB representation of intensity
+                    const color = new THREE.Color(intensity.x, intensity.y, intensity.z);
+                    currentLighting.primaryLightColor = color.getHex();
+                    
+                    // Crude intensity calculation based on luminance
+                    currentLighting.primaryLightIntensity = Math.max(intensity.x, intensity.y, intensity.z);
+                }
+                
+                // Spherical harmonics are complex 9-bands, for simple ambient we just approximate 
+                // by using the length or components to derive ambient. We'll simplify to just taking 
+                // something proportional to the first band or just fixed if too complex.
+                if (lightEstimate.sphericalHarmonicsCoefficients) {
+                    const sh = lightEstimate.sphericalHarmonicsCoefficients;
+                    // The first 3 coefficients are typically the ambient term (L00)
+                    const ambientColor = new THREE.Color(
+                       Math.max(0, sh[0]),
+                       Math.max(0, sh[1]), 
+                       Math.max(0, sh[2])
+                    );
+                    currentLighting.ambientColor = ambientColor.getHex();
+                    currentLighting.ambientIntensity = Math.max(sh[0], sh[1], sh[2]);
+                }
+                
+                // Also update the THREE.js light used in the AR scene so we see the lighting affect the wireframes!
+                if (lightEstimate.primaryLightDirection && lightEstimate.primaryLightIntensity) {
+                    light.position.set(currentLighting.primaryLightDirection[0], currentLighting.primaryLightDirection[1], currentLighting.primaryLightDirection[2]);
+                    light.intensity = 0.5 + Math.min(1.0, currentLighting.primaryLightIntensity * 0.5);
+                }
+            }
+        }
+
+        if (!planeSupportChecked) {
+          planeSupportChecked = true;
+          if (frame.detectedPlanes === undefined) {
+             setIsSupported(false);
+          } else {
+             setIsSupported(true);
+          }
+        }
+
+        if (frame.detectedPlanes) {
+          const detectedPlanes = frame.detectedPlanes;
+          
           detectedPlanes.forEach((plane: any) => {
             const pose = frame.getPose(plane.planeSpace, referenceSpace);
             if (!pose) return;
@@ -266,10 +398,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
 
             let mesh = planesMap.get(plane);
             if (!mesh) {
-              const orientation = typeof plane.orientation === 'string' ? plane.orientation : 'unknown';
-              const isHoriz = orientation.toLowerCase() === 'horizontal';
-              const color = isHoriz ? 0x10b981 : 0x3b82f6;
-              const material = new THREE.MeshBasicMaterial({
+              const material = new THREE.LineBasicMaterial({
                 color: color,
                 transparent: true,
                 opacity: 0.8,
@@ -313,162 +442,293 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
             if (!data) {
               planesDataRef.current.set(plane, {
                 id: planeIdCounter++,
-                orientation,
-                semanticLabel: plane.semanticLabel,
+                orientation: plane.orientation,
+                semanticLabel: semanticClass,
                 color: color,
                 polygon: poly,
                 position: {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z},
                 quaternion: {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w},
                 lastSeen: Date.now()
               });
-              setActivePlanesCount(planesMap.size);
-            }
-
-            let pose = null;
-            try {
-              pose = plane?.planeSpace ? frame.getPose(plane.planeSpace, referenceSpace) : null;
-            } catch (error) {
-              console.warn('Skipping plane with unavailable pose', error);
-            }
-
-            if (pose && mesh) {
-              mesh.position.copy(pose.transform.position);
-              mesh.quaternion.copy(pose.transform.orientation);
+            } else {
+              data.semanticLabel = semanticClass;
+              data.color = color;
               
-              const poly: {x: number, y: number, z: number}[] = [];
-              const polygonPoints = plane?.polygon || [];
-              for (let i = 0; i < polygonPoints.length; i++) {
-                const p = polygonPoints[i];
-                if (Number.isFinite(p?.x) && Number.isFinite(p?.y) && Number.isFinite(p?.z)) {
-                  poly.push({x: p.x, y: p.y, z: p.z});
-                }
-              }
-
-              const currentVersion = plane.lastChangedTime ?? timestamp;
-              if (poly.length >= 3 && planeGeometryVersion.get(plane) !== currentVersion) {
-                try {
-                  const shape = new THREE.Shape();
-                  for (let i = 0; i < poly.length; i++) {
-                    const p = poly[i];
-                    if (i === 0) shape.moveTo(p.x, -p.z);
-                    else shape.lineTo(p.x, -p.z);
-                  }
-                  shape.closePath();
-                  const geom = new THREE.ShapeGeometry(shape);
-                  geom.rotateX(-Math.PI / 2); // align to WebXR plane local space (Y is normal)
-                  mesh.geometry?.dispose();
-                  mesh.geometry = geom;
-                  planeGeometryVersion.set(plane, currentVersion);
-                } catch (error) {
-                  console.warn('Skipping invalid plane geometry', error);
-                }
-              }
-
-              const data = planesDataRef.current.get(plane);
-              if (data) {
-                data.polygon = poly;
-                data.position = {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z};
-                data.quaternion = {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w};
-              }
+              // Instead of overwriting polygon entirely, we let WebXR's plane tracking handle it 
+              // as this provides refined boundary updates over time, but we don't delete them.
+              data.polygon = poly;
+              
+              data.position = {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z};
+              data.quaternion = {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w};
+              data.lastSeen = Date.now();
             }
           });
 
-          let removedPlane = false;
+          // Keep stale planes to accumulate a scanned room, just hide their WebXR debug meshes if they aren't actively tracked
+          // Do not delete from `planesDataRef` to ensure merging/persistence across tracking angles.
+          const now = Date.now();
           planesMap.forEach((mesh, plane) => {
             if (!detectedPlanes.has(plane)) {
-              scene.remove(mesh);
-              disposePlaneMesh(mesh);
-              planesMap.delete(plane);
-              planeGeometryVersion.delete(plane);
-              planesDataRef.current.delete(plane);
-              removedPlane = true;
+              mesh.visible = false;
             }
           });
-          if (removedPlane) setActivePlanesCount(planesMap.size);
+          
+          const totalPlanes = planesDataRef.current.size;
+
+          if (frameCount % 15 === 0) {
+              setActivePlanesCount(totalPlanes);
+
+              let floorArea = 0;
+              let wallArea = 0;
+              let ceilingArea = 0;
+              let featureCount = 0;
+              let floorFound = false;
+              let ceilingFound = false;
+              let wallCount = 0;
+              let minY = Infinity;
+              let maxY = -Infinity;
+
+              planesDataRef.current.forEach((p) => {
+                 let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+                 let pMinY = Infinity, pMaxY = -Infinity;
+                 p.polygon.forEach(pt => {
+                    minX = Math.min(minX, pt.x);
+                    maxX = Math.max(maxX, pt.x);
+                    minZ = Math.min(minZ, pt.z);
+                    maxZ = Math.max(maxZ, pt.z);
+                 });
+                 // Position is the center point tracked by WebXR, we estimate height based on this
+                 pMinY = Math.min(pMinY, p.position.y);
+                 pMaxY = Math.max(pMaxY, p.position.y);
+                 minY = Math.min(minY, pMinY);
+                 maxY = Math.max(maxY, pMaxY);
+
+                 const areaApprox = (maxX - minX) * (maxZ - minZ);
+
+                 if (p.semanticLabel === 'floor') {
+                     floorFound = true;
+                     floorArea += areaApprox;
+                 } else if (p.semanticLabel === 'ceiling') {
+                     ceilingFound = true;
+                     ceilingArea += areaApprox;
+                 } else if (p.semanticLabel === 'wall') {
+                     wallCount++;
+                     wallArea += areaApprox;
+                 } else if (p.semanticLabel === 'door' || p.semanticLabel === 'window') {
+                     featureCount++;
+                 }
+              });
+
+              // Fallback height estimation if ceiling or floor not explicitly labeled but present across vertical extent
+              let estHeight = 0;
+              if (maxY !== -Infinity && minY !== Infinity) {
+                  estHeight = maxY - minY;
+                  if (!ceilingFound && estHeight < 1.5) estHeight = 2.5; // Assume default if we only mapped floor
+              }
+
+              setScanStats({ floorArea, wallArea, ceilingArea, featureCount, roomHeight: estHeight });
+
+              if (now - lastScanTime > 2000) {
+                 const addedPlanes = totalPlanes - lastPlaneCount;
+                 if (addedPlanes === 0 && totalPlanes > 0 && totalPlanes < 10) {
+                     slowProgressCount++;
+                 } else {
+                     slowProgressCount = 0;
+                 }
+                 lastScanTime = now;
+                 lastPlaneCount = totalPlanes;
+              }
+
+              if (slowProgressCount > 0 && floorArea < 1.0) {
+                 setGuidanceTip('Too few planes detected. Move slower and ensure good lighting.');
+                 setGuidanceIcon(<Info className="w-8 h-8 md:w-12 md:h-12" />);
+                 setScanQuality('low');
+              } else if (slowProgressCount > 1 && (wallCount < 4 || wallArea < 10.0)) {
+                 setGuidanceTip('Scan corners where walls meet to establish room shape.');
+                 setGuidanceIcon(<Compass className="w-8 h-8 md:w-12 md:h-12 animate-pulse" />);
+                 setScanQuality('medium');
+              } else if (!floorFound || floorArea < 1.0) {
+                 setGuidanceTip('Point at the floor and move slowly to map it.');
+                 setGuidanceIcon(<ArrowDown className="w-8 h-8 md:w-12 md:h-12" />);
+                 setScanQuality('low');
+              } else if (wallCount < 2 || wallArea < 3.0) {
+                 setGuidanceTip('Pan up and around to map the walls.');
+                 setGuidanceIcon(<RefreshCw className="w-8 h-8 md:w-12 md:h-12 animate-spin-slow" />);
+                 setScanQuality('medium');
+              } else if (wallCount < 4 || wallArea < 10.0) {
+                 setGuidanceTip('Look for other wall corners and capture their full height.');
+                 setGuidanceIcon(<Compass className="w-8 h-8 md:w-12 md:h-12" />);
+                 setScanQuality('medium');
+              } else if (!ceilingFound && ceilingArea < 1.0 && wallCount >= 3) {
+                 setGuidanceTip('Look up to scan the ceiling.');
+                 setGuidanceIcon(<ArrowDown className="w-8 h-8 md:w-12 md:h-12 rotate-180" />);
+                 setScanQuality('medium');
+              } else if (featureCount < 1) {
+                 setGuidanceTip('Room shape captured. Point at doors and windows to detect them.');
+                 setGuidanceIcon(<Check className="w-8 h-8 md:w-12 md:h-12" />);
+                 setScanQuality('high');
+              } else {
+                 setGuidanceTip('Great! Tap Finish Mapping when you are ready.');
+                 setGuidanceIcon(<Check className="w-8 h-8 md:w-12 md:h-12 text-emerald-400" />);
+                 setScanQuality('high');
+              }
+          }
+        }
+      }
+
+      frameCount++;
+      if (frameCount % 30 === 0 && planesDataRef.current.size >= 2) {
+          try {
+              const planesArray = Array.from(planesDataRef.current.values());
+              const roomModel = RoomReconstruction.buildRoomModel(planesArray);
+              setLiveRoomModel(roomModel);
+              
+              // Clear previous wireframes safely
+              const disposeNode = (node: any) => {
+                  if (node.geometry) node.geometry.dispose();
+                  if (node.material) {
+                      if (Array.isArray(node.material)) {
+                          node.material.forEach((m: any) => m.dispose());
+                      } else {
+                          node.material.dispose();
+                      }
+                  }
+                  if (node.children) {
+                      node.children.forEach(disposeNode);
+                  }
+              };
+              wireframeGroup.children.forEach(disposeNode);
+              wireframeGroup.clear();
+
+              // Build wireframe for walls
+              roomModel.enhancedWalls.forEach(w => {
+                  const geometry = new THREE.PlaneGeometry(w.width, w.height);
+                  const edges = new THREE.EdgesGeometry(geometry);
+                  const material = new THREE.LineBasicMaterial({ color: 0x3b82f6, linewidth: 2 });
+                  const line = new THREE.LineSegments(edges, material);
+                  line.position.set(w.position[0], w.position[1], w.position[2]);
+                  line.quaternion.set(w.quaternion[0], w.quaternion[1], w.quaternion[2], w.quaternion[3]);
+                  wireframeGroup.add(line);
+              });
+
+              // Build wireframe for floor
+              if (roomModel.floorHullPoints.length > 2) {
+                  const floorPoints: THREE.Vector3[] = [];
+                  roomModel.floorHullPoints.forEach(p => {
+                      floorPoints.push(new THREE.Vector3(p.x, 0, -p.z));
+                  });
+                  const floorGeom = new THREE.BufferGeometry().setFromPoints(floorPoints);
+                  const floorMat = new THREE.LineBasicMaterial({ color: 0x10b981, linewidth: 2 });
+                  
+                  const floorLine = new THREE.LineLoop(floorGeom, floorMat);
+                  floorLine.position.y = roomModel.floorY;
+                  wireframeGroup.add(floorLine);
+                  
+                  const ceilLine = new THREE.LineLoop(floorGeom, floorMat);
+                  ceilLine.position.y = roomModel.ceilingY;
+                  wireframeGroup.add(ceilLine);
+              }
+
+              // Build wireframe for features
+              roomModel.features.forEach(f => {
+                  const geometry = new THREE.PlaneGeometry(f.width, f.height);
+                  const edges = new THREE.EdgesGeometry(geometry);
+                  const material = new THREE.LineBasicMaterial({ color: f.type === 'door' ? 0x8b5cf6 : 0x38bdf8, linewidth: 2 });
+                  const line = new THREE.LineSegments(edges, material);
+                  line.position.set(f.localCenter[0], 0, f.localCenter[1]);
+                  line.rotation.set(-Math.PI / 2, 0, 0);
+
+                  // Features need to be wrapped in a group to apply the parent position/quaternion like in RoomViewer
+                  const group = new THREE.Group();
+                  group.position.set(f.position[0], f.position[1], f.position[2]);
+                  group.quaternion.set(f.quaternion[0], f.quaternion[1], f.quaternion[2], f.quaternion[3]);
+                  group.add(line);
+                  wireframeGroup.add(group);
+              });
+              
+          } catch(err) {
+              console.error("Wireframe update error", err);
+          }
+      }
+
+      // Update guidance animations
+      if (frameCount >= 0) {
+        const totalPlanes = planesDataRef.current.size;
+        
+        // Show floor circle if no floor found or early in scan
+        if (totalPlanes === 0) {
+            floorCircle.visible = true;
+            // Place circle on the floor in front of the camera
+            const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+            dir.y = 0;
+            if (dir.lengthSq() < 0.01) { dir.set(0, 0, -1); }
+            dir.normalize();
+            const pos = camera.position.clone().add(dir.multiplyScalar(1.5));
+            pos.y = -camera.position.y * 0.8; // Approximate floor if device is held at chest height
+            floorCircle.position.copy(pos);
+            const scale = 1.0 + Math.sin(timestamp / 150) * 0.2;
+            floorCircle.scale.set(scale, scale, scale);
+            movingArrow.visible = false;
+        } else {
+            floorCircle.visible = false;
+            
+            if (slowProgressCount > 0 && totalPlanes < 10) {
+                movingArrow.visible = true;
+                const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+                dir.y = 0;
+                if (dir.lengthSq() < 0.01) { dir.set(0, 0, -1); }
+                dir.normalize();
+                
+                // Animate arrow swiping left and right
+                const swipe = Math.sin(timestamp / 500) * 0.5;
+                const right = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0, 1, 0)).normalize();
+                
+                const pos = camera.position.clone()
+                    .add(dir.multiplyScalar(1.0))
+                    .add(right.multiplyScalar(swipe));
+                
+                movingArrow.position.copy(pos);
+                // Rotate arrow to point in the direction of swipe
+                const pointDir = Math.cos(timestamp / 500) > 0 ? right : right.clone().negate();
+                movingArrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), pointDir);
+            } else {
+                movingArrow.visible = false;
+            }
         }
       }
 
       renderer.render(scene, camera);
     };
 
-    renderer.setAnimationLoop(render);
+    animate();
+    } catch (err) { console.error("AR Start error", err); }
 
     return () => {
-      isMountedRef.current = false;
-      clearSessionStartTimer(sessionStartTimerRef);
-      const activeSession = currentSession || sessionRef.current;
-      rendererRef.current = null;
-      sessionRef.current = null;
-      renderer.xr.removeEventListener('sessionstart', onSessionStart);
-      renderer.xr.removeEventListener('sessionend', onSessionEnd);
-      window.removeEventListener('resize', onWindowResize);
-      renderer.setAnimationLoop(null);
-      if (activeSession) activeSession.end().catch(() => {});
-      planesMap.forEach(disposePlaneMesh);
-      renderer.dispose();
-      scene.clear();
-      if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
+      isMounted = false;
+      if (onWindowResize) {
+        window.removeEventListener('resize', onWindowResize);
+      }
+      if (renderer) {
+        renderer.setAnimationLoop(null);
+        renderer.dispose();
+        if (container && renderer.domElement && container.contains(renderer.domElement)) {
+          container.removeChild(renderer.domElement);
+        }
+      }
+      if (currentSession) {
+        currentSession.end().catch(() => {});
+      }
+      if (planesMap) {
+        planesMap.forEach((mesh) => {
+            mesh.geometry?.dispose();
+            (mesh.material as THREE.Material)?.dispose();
+        });
+      }
+      if (scene) {
+        scene.clear();
+      }
     };
   }, []);
-
-  const handleStartSession = async () => {
-    if (startRequestedRef.current || sessionRef.current) return;
-
-    const xr = getXRSystem();
-    const renderer = rendererRef.current;
-    const overlayDiv = document.getElementById('ar-overlay');
-
-    if (!xr?.requestSession || !renderer) {
-      setIsSessionStarting(false);
-      setSessionStartError('WebXR AR is not available in this browser.');
-      startRequestedRef.current = false;
-      return;
-    }
-
-    startRequestedRef.current = true;
-    setIsSessionStarting(true);
-    setSessionStartError(null);
-
-    const sessionInit: Record<string, unknown> = {
-      requiredFeatures: ['plane-detection'],
-      optionalFeatures: overlayDiv ? ['dom-overlay'] : []
-    };
-    if (overlayDiv) sessionInit.domOverlay = { root: overlayDiv };
-
-    renderer.xr.setReferenceSpaceType('local');
-
-    sessionStartTimerRef.current = window.setTimeout(() => {
-      if (!isMountedRef.current || !startRequestedRef.current) return;
-      setSessionStartError('Still waiting for AR permission. Please approve the browser prompt to continue.');
-    }, SESSION_START_TIMEOUT_MS);
-
-    try {
-      const session = await xr.requestSession('immersive-ar', sessionInit);
-      sessionRef.current = session;
-
-      try {
-        await renderer.xr.setSession(session as any);
-      } catch (error) {
-        sessionRef.current = null;
-        await session.end().catch(() => {});
-        throw error;
-      }
-
-      clearSessionStartTimer(sessionStartTimerRef);
-      startRequestedRef.current = false;
-      if (!isMountedRef.current) return;
-      setIsSessionStarting(false);
-      setSessionStartError(null);
-    } catch (error) {
-      console.warn('Unable to start AR scan session', error);
-      clearSessionStartTimer(sessionStartTimerRef);
-      sessionRef.current = null;
-      startRequestedRef.current = false;
-      if (!isMountedRef.current) return;
-      setIsSessionStarting(false);
-      setSessionStartError(getSessionErrorMessage(error));
-    }
-  };
 
   const handleFinish = () => {
       const planesArray = Array.from(planesDataRef.current.values());
@@ -498,23 +758,30 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
         >
           <div className="flex justify-between items-start z-10 w-full">
            <div className="space-y-4 pointer-events-auto">
-             <Button
-               onClick={handleStartSession}
-               disabled={isSessionStarting}
-               className="bg-indigo-600 hover:bg-indigo-500 text-white w-full"
-             >
-               <Scan className="w-5 h-5 mr-2" />
-               {isSessionStarting ? 'Starting AR…' : 'Start AR Session'}
-             </Button>
-             {sessionStartError && (
-               <p className="text-xs text-amber-300 bg-amber-500/10 border border-amber-400/30 rounded-lg px-3 py-2">
-                 {sessionStartError}
-               </p>
-             )}
-             <div className="bg-black/50 backdrop-blur text-white px-4 py-2 rounded-xl border border-white/10 shadow-lg">
-                <div className="text-xs text-slate-300 font-semibold mb-1 uppercase tracking-wider">Detected Surfaces</div>
-                <div className="text-3xl font-bold font-mono">
-                    {activePlanesCount}
+             <div className="bg-black/50 backdrop-blur w-44 text-white px-4 py-3 rounded-xl border border-white/10 shadow-lg flex flex-col gap-2">
+                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
+                   <span>Planes</span>
+                   <span className="text-white font-mono">{activePlanesCount}</span>
+                </div>
+                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
+                   <span>Floor Area</span>
+                   <span className="text-emerald-400 font-mono">{scanStats.floorArea.toFixed(1)} m²</span>
+                </div>
+                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
+                   <span>Ceiling Area</span>
+                   <span className="text-cyan-400 font-mono">{scanStats.ceilingArea.toFixed(1)} m²</span>
+                </div>
+                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
+                   <span>Wall Area</span>
+                   <span className="text-blue-400 font-mono">{scanStats.wallArea.toFixed(1)} m²</span>
+                </div>
+                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
+                   <span>Height</span>
+                   <span className="text-rose-400 font-mono">{scanStats.roomHeight > 0.1 ? scanStats.roomHeight.toFixed(2) + 'm' : '--'}</span>
+                </div>
+                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
+                   <span>Features</span>
+                   <span className="text-purple-400 font-mono">{scanStats.featureCount}</span>
                 </div>
              </div>
              
