@@ -58,11 +58,13 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
       ? planes.reduce((sum, plane) => sum + (plane.confidence ?? 0), 0) / planes.length
       : 0;
     const sensorSamples = planes.filter((plane) => plane.sensor).length;
+    const depthSamples = planes.filter((plane) => plane.depthActive).length;
 
     return {
       confidentPlanes: confidentPlanes.length,
       averageConfidence,
-      sensorSamples
+      sensorSamples,
+      depthSamples
     };
   }, [planes]);
 
@@ -288,8 +290,8 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
                 <div className="font-semibold text-emerald-300">{scanStats.averageConfidence.toFixed(0)}%</div>
               </div>
               <div className="rounded-lg bg-white/5 px-3 py-2">
-                <div className="text-slate-400">Sensor fused</div>
-                <div className="font-semibold text-indigo-300">{scanStats.sensorSamples}/{planes.length}</div>
+                <div className="text-slate-400">Sensor/depth</div>
+                <div className="font-semibold text-indigo-300">{scanStats.sensorSamples}/{scanStats.depthSamples}</div>
               </div>
             </div>
             <p className="text-xs text-slate-400 mt-2">{scanStats.confidentPlanes} surfaces passed stability filters.</p>

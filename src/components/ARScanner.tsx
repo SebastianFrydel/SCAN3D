@@ -28,10 +28,16 @@ export interface ScannedPlane {
   hitCount?: number;
   lastSeen?: number;
   sensor?: SensorSnapshot;
+  depthActive?: boolean;
 }
 
 type SensorPermissionState = 'unknown' | 'granted' | 'denied' | 'unsupported';
 type MotionQuality = 'camera-only' | 'hold-steady' | 'good' | 'too-fast';
+type WakeLockSentinelLike = {
+  release: () => Promise<void>;
+  addEventListener?: (type: 'release', listener: () => void) => void;
+  removeEventListener?: (type: 'release', listener: () => void) => void;
+};
 
 type ScanQualityState = {
   stablePlanes: number;
@@ -41,6 +47,8 @@ type ScanQualityState = {
   message: string;
   angularSpeed: number;
   motionMagnitude: number;
+  depthActive: boolean;
+  wakeLockActive: boolean;
 };
 
 const SESSION_START_TIMEOUT_MS = 8000;
@@ -54,7 +62,9 @@ const DEFAULT_SCAN_QUALITY: ScanQualityState = {
   sensorPermission: 'unknown',
   message: 'Camera-only mode until motion sensors respond.',
   angularSpeed: 0,
-  motionMagnitude: 0
+  motionMagnitude: 0,
+  depthActive: false,
+  wakeLockActive: false
 };
 
 type XRSessionLike = {
@@ -158,11 +168,13 @@ const getMotionQuality = (snapshot: SensorSnapshot | null, permission: SensorPer
   return 'good';
 };
 
-const getMotionMessage = (quality: MotionQuality) => {
-  if (quality === 'good') return 'Sensor fusion active. Keep a slow, steady pan for best plane quality.';
-  if (quality === 'too-fast') return 'Move slower — fast rotation reduces plane accuracy.';
-  if (quality === 'hold-steady') return 'Start panning slowly so IMU data can improve scan confidence.';
-  return 'Camera-only mode. Enable motion sensors for better scan quality guidance.';
+const getMotionMessage = (quality: MotionQuality, depthActive: boolean) => {
+  const depthPrefix = depthActive ? 'Depth sensing is active. ' : '';
+
+  if (quality === 'good') return `${depthPrefix}Sensor fusion active. Keep a slow, steady pan for best plane quality.`;
+  if (quality === 'too-fast') return `${depthPrefix}Move slower — fast rotation reduces plane accuracy.`;
+  if (quality === 'hold-steady') return `${depthPrefix}Start panning slowly so IMU data can improve scan confidence.`;
+  return `${depthPrefix}Camera-only mode. Enable motion sensors for better scan quality guidance.`;
 };
 
 const getMotionScore = (quality: MotionQuality) => {
@@ -172,10 +184,22 @@ const getMotionScore = (quality: MotionQuality) => {
   return 0.5;
 };
 
-const getPlaneConfidence = (area: number, hitCount: number, motionQuality: MotionQuality) => {
+const getPlaneConfidence = (area: number, hitCount: number, motionQuality: MotionQuality, depthActive: boolean) => {
   const areaScore = Math.min(area / 1.2, 1);
   const persistenceScore = Math.min(hitCount / 24, 1);
-  return Math.round((areaScore * 0.35 + persistenceScore * 0.4 + getMotionScore(motionQuality) * 0.25) * 100);
+  const depthScore = depthActive ? 1 : 0.45;
+  return Math.round((areaScore * 0.3 + persistenceScore * 0.35 + getMotionScore(motionQuality) * 0.25 + depthScore * 0.1) * 100);
+};
+
+const hasDepthInformation = (frame: any, referenceSpace: any) => {
+  if (!frame?.getViewerPose || !frame?.getDepthInformation) return false;
+
+  try {
+    const viewerPose = frame.getViewerPose(referenceSpace);
+    return Boolean(viewerPose?.views?.some((view: any) => frame.getDepthInformation(view)));
+  } catch {
+    return false;
+  }
 };
 
 export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: ScannedPlane[]) => void, onCancel: () => void }) {
@@ -192,21 +216,44 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
   const sensorSnapshotRef = useRef<SensorSnapshot | null>(null);
   const sensorPermissionRef = useRef<SensorPermissionState>('unknown');
   const lastSensorUiUpdateRef = useRef(0);
+  const lastQualityUiUpdateRef = useRef(0);
+  const stablePlaneCountRef = useRef(0);
+  const totalPlaneCountRef = useRef(0);
+  const depthActiveRef = useRef(false);
+  const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
   const [isSessionStarting, setIsSessionStarting] = useState(false);
   const [sessionStartError, setSessionStartError] = useState<string | null>(null);
 
-  const updateScanQuality = (stablePlanes: number, totalPlanes: number) => {
+  const updateScanQuality = (stablePlanes: number, totalPlanes: number, timestamp = performance.now(), force = false) => {
     const snapshot = sensorSnapshotRef.current;
     const motionQuality = getMotionQuality(snapshot, sensorPermissionRef.current);
+    const depthActive = depthActiveRef.current;
+    const wakeLockActive = Boolean(wakeLockRef.current);
+    const shouldUpdate = force ||
+      stablePlaneCountRef.current !== stablePlanes ||
+      totalPlaneCountRef.current !== totalPlanes ||
+      scanQualityRef.current.motionQuality !== motionQuality ||
+      scanQualityRef.current.sensorPermission !== sensorPermissionRef.current ||
+      scanQualityRef.current.depthActive !== depthActive ||
+      scanQualityRef.current.wakeLockActive !== wakeLockActive ||
+      timestamp - lastQualityUiUpdateRef.current > 650;
 
+    stablePlaneCountRef.current = stablePlanes;
+    totalPlaneCountRef.current = totalPlanes;
+
+    if (!shouldUpdate) return;
+
+    lastQualityUiUpdateRef.current = timestamp;
     const nextQuality = {
       stablePlanes,
       totalPlanes,
       motionQuality,
       sensorPermission: sensorPermissionRef.current,
-      message: getMotionMessage(motionQuality),
+      message: getMotionMessage(motionQuality, depthActive),
       angularSpeed: snapshot?.angularSpeed ?? 0,
-      motionMagnitude: snapshot?.motionMagnitude ?? 0
+      motionMagnitude: snapshot?.motionMagnitude ?? 0,
+      depthActive,
+      wakeLockActive
     };
 
     scanQualityRef.current = nextQuality;
@@ -289,6 +336,10 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     const onSessionEnd = () => {
       sessionRef.current = null;
       startRequestedRef.current = false;
+      depthActiveRef.current = false;
+      if (wakeLockRef.current) wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
+      updateScanQuality(stablePlaneCountRef.current, totalPlaneCountRef.current, performance.now(), true);
       if (!isMountedRef.current) return;
       setIsSessionStarting(false);
     };
@@ -316,6 +367,9 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
           renderer.render(scene, camera);
           return;
         }
+
+        const depthActive = hasDepthInformation(frame, referenceSpace);
+        if (depthActiveRef.current !== depthActive) depthActiveRef.current = depthActive;
 
         const detectedPlanes = getDetectedPlaneSet(frame.detectedPlanes);
         if (detectedPlanes) {
@@ -403,8 +457,9 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
                 data.area = area;
                 data.hitCount = nextHitCount;
                 data.lastSeen = timestamp;
-                data.confidence = getPlaneConfidence(area, nextHitCount, motionQuality);
+                data.confidence = getPlaneConfidence(area, nextHitCount, motionQuality, depthActiveRef.current);
                 data.sensor = sensorSnapshotRef.current || undefined;
+                data.depthActive = depthActiveRef.current;
               }
             }
           });
@@ -427,7 +482,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
             (plane.confidence ?? 0) >= 45
           ).length;
           if (removedPlane) setActivePlanesCount(planesMap.size);
-          updateScanQuality(stablePlanes, planesMap.size);
+          updateScanQuality(stablePlanes, planesMap.size, timestamp);
         }
       }
       renderer.render(scene, camera);
@@ -446,6 +501,8 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
       window.removeEventListener('resize', onWindowResize);
       renderer.setAnimationLoop(null);
       if (activeSession) activeSession.end().catch(() => {});
+      if (wakeLockRef.current) wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
       planesMap.forEach(disposePlaneMesh);
       renderer.dispose();
       scene.clear();
@@ -485,6 +542,24 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes);
   };
 
+  const requestWakeLock = async () => {
+    const wakeLock = (navigator as Navigator & { wakeLock?: { request: (type: 'screen') => Promise<WakeLockSentinelLike> } }).wakeLock;
+    if (!wakeLock?.request || wakeLockRef.current) return;
+
+    try {
+      const sentinel = await wakeLock.request('screen');
+      const onRelease = () => {
+        wakeLockRef.current = null;
+        updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes, performance.now(), true);
+      };
+      sentinel.addEventListener?.('release', onRelease);
+      wakeLockRef.current = sentinel;
+      updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes, performance.now(), true);
+    } catch (error) {
+      console.warn('Unable to request screen wake lock', error);
+    }
+  };
+
   const handleStartSession = async () => {
     if (startRequestedRef.current || sessionRef.current) return;
 
@@ -504,10 +579,21 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     setSessionStartError(null);
 
     await requestMobileSensorAccess();
+    await requestWakeLock();
 
     const sessionInit: Record<string, unknown> = {
       requiredFeatures: ['plane-detection'],
-      optionalFeatures: overlayDiv ? ['dom-overlay'] : []
+      optionalFeatures: [
+        ...(overlayDiv ? ['dom-overlay'] : []),
+        'depth-sensing',
+        'hit-test',
+        'anchors',
+        'light-estimation'
+      ],
+      depthSensing: {
+        usagePreference: ['cpu-optimized', 'gpu-optimized'],
+        dataFormatPreference: ['luminance-alpha', 'float32']
+      }
     };
     if (overlayDiv) sessionInit.domOverlay = { root: overlayDiv };
 
@@ -540,9 +626,14 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
       clearSessionStartTimer(sessionStartTimerRef);
       sessionRef.current = null;
       startRequestedRef.current = false;
+      if (wakeLockRef.current) {
+        await wakeLockRef.current.release().catch(() => {});
+        wakeLockRef.current = null;
+      }
       if (!isMountedRef.current) return;
       setIsSessionStarting(false);
       setSessionStartError(getSessionErrorMessage(error));
+      updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes, performance.now(), true);
     }
   };
 
@@ -597,6 +688,18 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
                     <div className="flex items-center gap-1 text-slate-400"><Activity className="w-3 h-3" /> IMU</div>
                     <div className={scanQuality.sensorPermission === 'granted' ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
                       {scanQuality.sensorPermission}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-white/5 px-3 py-2">
+                    <div className="text-slate-400">Depth</div>
+                    <div className={scanQuality.depthActive ? 'text-emerald-300 font-semibold' : 'text-slate-300 font-semibold'}>
+                      {scanQuality.depthActive ? 'active' : 'optional'}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-white/5 px-3 py-2">
+                    <div className="text-slate-400">Screen</div>
+                    <div className={scanQuality.wakeLockActive ? 'text-emerald-300 font-semibold' : 'text-slate-300 font-semibold'}>
+                      {scanQuality.wakeLockActive ? 'awake' : 'normal'}
                     </div>
                   </div>
                 </div>
