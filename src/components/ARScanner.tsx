@@ -1,10 +1,22 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { Check, Info, X, Map as MapIcon, ArrowDown, ArrowRight, ArrowLeft, RefreshCw, Compass } from 'lucide-react';
+import { Activity, Check, Gauge, RotateCcw, Scan, ShieldCheck, X } from 'lucide-react';
 import { Button } from './ui/button';
 import { RoomReconstruction } from '../core/processing/RoomReconstruction';
 import { RoomLighting, RoomModel } from '../core/models/types';
 import { MiniMap } from './MiniMap';
+
+export interface SensorSnapshot {
+  timestamp: number;
+  alpha?: number | null;
+  beta?: number | null;
+  gamma?: number | null;
+  acceleration?: { x: number | null; y: number | null; z: number | null };
+  accelerationIncludingGravity?: { x: number | null; y: number | null; z: number | null };
+  rotationRate?: { alpha: number | null; beta: number | null; gamma: number | null };
+  motionMagnitude: number;
+  angularSpeed: number;
+}
 
 export interface ScannedPlane {
   id: number;
@@ -14,172 +26,332 @@ export interface ScannedPlane {
   position: {x: number, y: number, z: number};
   quaternion: {x: number, y: number, z: number, w: number};
   color: number;
-  lastSeen: number;
+  area?: number;
+  confidence?: number;
+  hitCount?: number;
+  lastSeen?: number;
+  sensor?: SensorSnapshot;
+  depthActive?: boolean;
 }
 
-let isWebXRRequesting = false;
+type SensorPermissionState = 'unknown' | 'granted' | 'denied' | 'unsupported';
+type MotionQuality = 'camera-only' | 'hold-steady' | 'good' | 'too-fast';
+type WakeLockSentinelLike = {
+  release: () => Promise<void>;
+  addEventListener?: (type: 'release', listener: () => void) => void;
+  removeEventListener?: (type: 'release', listener: () => void) => void;
+};
 
-export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: ScannedPlane[], scaleFactor: number, lighting?: RoomLighting) => void, onCancel: () => void }) {
+type ScanQualityState = {
+  stablePlanes: number;
+  totalPlanes: number;
+  motionQuality: MotionQuality;
+  sensorPermission: SensorPermissionState;
+  message: string;
+  angularSpeed: number;
+  motionMagnitude: number;
+  depthActive: boolean;
+  wakeLockActive: boolean;
+};
+
+const SESSION_START_TIMEOUT_MS = 8000;
+const STABLE_PLANE_HITS = 6;
+const MIN_PLANE_AREA_M2 = 0.04;
+
+const DEFAULT_SCAN_QUALITY: ScanQualityState = {
+  stablePlanes: 0,
+  totalPlanes: 0,
+  motionQuality: 'camera-only',
+  sensorPermission: 'unknown',
+  message: 'Camera-only mode until motion sensors respond.',
+  angularSpeed: 0,
+  motionMagnitude: 0,
+  depthActive: false,
+  wakeLockActive: false
+};
+
+type XRSessionLike = {
+  end: () => Promise<void>;
+};
+
+type XRSystemLike = {
+  requestSession?: (mode: 'immersive-ar', options: Record<string, unknown>) => Promise<XRSessionLike>;
+};
+
+type PermissionCapableEvent = {
+  requestPermission?: () => Promise<'granted' | 'denied'>;
+};
+
+const getXRSystem = () => (navigator as Navigator & { xr?: XRSystemLike }).xr;
+
+const clearSessionStartTimer = (timerRef: React.MutableRefObject<number | null>) => {
+  if (timerRef.current) {
+    window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }
+};
+
+const getSessionErrorMessage = (error: unknown) => {
+  const name = error instanceof DOMException ? error.name : '';
+
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return 'Camera/AR permission was denied. Please allow camera access and try again.';
+  }
+
+  if (name === 'NotSupportedError') {
+    return 'This browser or device does not support the WebXR plane detection needed for scanning.';
+  }
+
+  return 'Could not start AR. Please try again on a secure HTTPS page with a WebXR-compatible browser.';
+};
+
+const getDetectedPlaneSet = (detectedPlanes: unknown): Set<any> | null => {
+  if (!detectedPlanes) return null;
+  if (detectedPlanes instanceof Set) return detectedPlanes;
+
+  try {
+    return new Set(Array.from(detectedPlanes as Iterable<any>));
+  } catch (error) {
+    console.warn('Ignoring unsupported detectedPlanes payload', error);
+    return null;
+  }
+};
+
+const disposePlaneMesh = (mesh: THREE.Mesh) => {
+  mesh.geometry?.dispose();
+  const material = mesh.material;
+  if (Array.isArray(material)) {
+    material.forEach((item) => item.dispose());
+  } else {
+    material?.dispose();
+  }
+};
+
+const toFiniteNumber = (value: number | null | undefined) => Number.isFinite(value) ? value as number : 0;
+
+const vectorMagnitude = (vector?: { x: number | null; y: number | null; z: number | null } | null) => {
+  if (!vector) return 0;
+  const x = toFiniteNumber(vector.x);
+  const y = toFiniteNumber(vector.y);
+  const z = toFiniteNumber(vector.z);
+  return Math.sqrt(x * x + y * y + z * z);
+};
+
+const rotationMagnitude = (rotation?: { alpha: number | null; beta: number | null; gamma: number | null } | null) => {
+  if (!rotation) return 0;
+  const alpha = toFiniteNumber(rotation.alpha);
+  const beta = toFiniteNumber(rotation.beta);
+  const gamma = toFiniteNumber(rotation.gamma);
+  return Math.sqrt(alpha * alpha + beta * beta + gamma * gamma);
+};
+
+const cloneVector = (vector?: DeviceMotionEventAcceleration | null) => ({
+  x: vector?.x ?? null,
+  y: vector?.y ?? null,
+  z: vector?.z ?? null
+});
+
+const polygonArea = (points: {x: number, y: number, z: number}[]) => {
+  if (points.length < 3) return 0;
+
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    const current = points[i];
+    const next = points[(i + 1) % points.length];
+    sum += current.x * next.z - next.x * current.z;
+  }
+
+  return Math.abs(sum) / 2;
+};
+
+const getMotionQuality = (snapshot: SensorSnapshot | null, permission: SensorPermissionState): MotionQuality => {
+  if (permission !== 'granted' || !snapshot) return 'camera-only';
+  if (snapshot.angularSpeed > 160 || snapshot.motionMagnitude > 7) return 'too-fast';
+  if (snapshot.angularSpeed < 4 && snapshot.motionMagnitude < 0.08) return 'hold-steady';
+  return 'good';
+};
+
+const getMotionMessage = (quality: MotionQuality, depthActive: boolean) => {
+  const depthPrefix = depthActive ? 'Depth sensing is active. ' : '';
+
+  if (quality === 'good') return `${depthPrefix}Sensor fusion active. Keep a slow, steady pan for best plane quality.`;
+  if (quality === 'too-fast') return `${depthPrefix}Move slower — fast rotation reduces plane accuracy.`;
+  if (quality === 'hold-steady') return `${depthPrefix}Start panning slowly so IMU data can improve scan confidence.`;
+  return `${depthPrefix}Camera-only mode. Enable motion sensors for better scan quality guidance.`;
+};
+
+const getMotionScore = (quality: MotionQuality) => {
+  if (quality === 'good') return 1;
+  if (quality === 'hold-steady') return 0.65;
+  if (quality === 'too-fast') return 0.35;
+  return 0.5;
+};
+
+const getPlaneConfidence = (area: number, hitCount: number, motionQuality: MotionQuality, depthActive: boolean) => {
+  const areaScore = Math.min(area / 1.2, 1);
+  const persistenceScore = Math.min(hitCount / 24, 1);
+  const depthScore = depthActive ? 1 : 0.45;
+  return Math.round((areaScore * 0.3 + persistenceScore * 0.35 + getMotionScore(motionQuality) * 0.25 + depthScore * 0.1) * 100);
+};
+
+const hasDepthInformation = (frame: any, referenceSpace: any) => {
+  if (!frame?.getViewerPose || !frame?.getDepthInformation) return false;
+
+  try {
+    const viewerPose = frame.getViewerPose(referenceSpace);
+    return Boolean(viewerPose?.views?.some((view: any) => frame.getDepthInformation(view)));
+  } catch {
+    return false;
+  }
+};
+
+export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: ScannedPlane[]) => void, onCancel: () => void }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [activePlanesCount, setActivePlanesCount] = useState(0);
+  const [scanQuality, setScanQuality] = useState<ScanQualityState>(DEFAULT_SCAN_QUALITY);
+  const scanQualityRef = useRef<ScanQualityState>(DEFAULT_SCAN_QUALITY);
   const planesDataRef = useRef<Map<any, ScannedPlane>>(new Map());
-  const [isSupported, setIsSupported] = useState<boolean | null>(null);
-  const [scanQuality, setScanQuality] = useState<'low' | 'medium' | 'high'>('low');
-  const [scanStats, setScanStats] = useState({ floorArea: 0, wallArea: 0, ceilingArea: 0, featureCount: 0, roomHeight: 0 });
-  const [liveRoomModel, setLiveRoomModel] = useState<RoomModel | null>(null);
-  const [guidanceTip, setGuidanceTip] = useState<string>('Point at floor to start');
-  const [guidanceIcon, setGuidanceIcon] = useState<React.ReactNode>(<ArrowDown className="w-8 h-8 md:w-12 md:h-12" />);
+  const startRequestedRef = useRef(false);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sessionRef = useRef<XRSessionLike | null>(null);
+  const sessionStartTimerRef = useRef<number | null>(null);
+  const isMountedRef = useRef(true);
+  const sensorSnapshotRef = useRef<SensorSnapshot | null>(null);
+  const sensorPermissionRef = useRef<SensorPermissionState>('unknown');
+  const lastSensorUiUpdateRef = useRef(0);
+  const lastQualityUiUpdateRef = useRef(0);
+  const stablePlaneCountRef = useRef(0);
+  const totalPlaneCountRef = useRef(0);
+  const depthActiveRef = useRef(false);
+  const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
+  const [isSessionStarting, setIsSessionStarting] = useState(false);
+  const [sessionStartError, setSessionStartError] = useState<string | null>(null);
 
-  const engineApiRef = useRef<any>(null);
+  const updateScanQuality = (stablePlanes: number, totalPlanes: number, timestamp = performance.now(), force = false) => {
+    const snapshot = sensorSnapshotRef.current;
+    const motionQuality = getMotionQuality(snapshot, sensorPermissionRef.current);
+    const depthActive = depthActiveRef.current;
+    const wakeLockActive = Boolean(wakeLockRef.current);
+    const shouldUpdate = force ||
+      stablePlaneCountRef.current !== stablePlanes ||
+      totalPlaneCountRef.current !== totalPlanes ||
+      scanQualityRef.current.motionQuality !== motionQuality ||
+      scanQualityRef.current.sensorPermission !== sensorPermissionRef.current ||
+      scanQualityRef.current.depthActive !== depthActive ||
+      scanQualityRef.current.wakeLockActive !== wakeLockActive ||
+      timestamp - lastQualityUiUpdateRef.current > 650;
+
+    stablePlaneCountRef.current = stablePlanes;
+    totalPlaneCountRef.current = totalPlanes;
+
+    if (!shouldUpdate) return;
+
+    lastQualityUiUpdateRef.current = timestamp;
+    const nextQuality = {
+      stablePlanes,
+      totalPlanes,
+      motionQuality,
+      sensorPermission: sensorPermissionRef.current,
+      message: getMotionMessage(motionQuality, depthActive),
+      angularSpeed: snapshot?.angularSpeed ?? 0,
+      motionMagnitude: snapshot?.motionMagnitude ?? 0,
+      depthActive,
+      wakeLockActive
+    };
+
+    scanQualityRef.current = nextQuality;
+    setScanQuality(nextQuality);
+  };
 
   useEffect(() => {
+    const onDeviceMotion = (event: DeviceMotionEvent) => {
+      const acceleration = cloneVector(event.acceleration);
+      const accelerationIncludingGravity = cloneVector(event.accelerationIncludingGravity);
+      const rotationRate = {
+        alpha: event.rotationRate?.alpha ?? null,
+        beta: event.rotationRate?.beta ?? null,
+        gamma: event.rotationRate?.gamma ?? null
+      };
+
+      sensorPermissionRef.current = 'granted';
+      sensorSnapshotRef.current = {
+        ...(sensorSnapshotRef.current || { timestamp: event.timeStamp, motionMagnitude: 0, angularSpeed: 0 }),
+        timestamp: event.timeStamp,
+        acceleration,
+        accelerationIncludingGravity,
+        rotationRate,
+        motionMagnitude: vectorMagnitude(event.acceleration),
+        angularSpeed: rotationMagnitude(event.rotationRate)
+      };
+
+      if (event.timeStamp - lastSensorUiUpdateRef.current > 350) {
+        lastSensorUiUpdateRef.current = event.timeStamp;
+        updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes);
+      }
+    };
+
+    const onDeviceOrientation = (event: DeviceOrientationEvent) => {
+      sensorPermissionRef.current = 'granted';
+      sensorSnapshotRef.current = {
+        ...(sensorSnapshotRef.current || { timestamp: event.timeStamp, motionMagnitude: 0, angularSpeed: 0 }),
+        timestamp: event.timeStamp,
+        alpha: event.alpha,
+        beta: event.beta,
+        gamma: event.gamma
+      };
+    };
+
+    window.addEventListener('devicemotion', onDeviceMotion, { passive: true });
+    window.addEventListener('deviceorientation', onDeviceOrientation, { passive: true });
+
+    return () => {
+      window.removeEventListener('devicemotion', onDeviceMotion);
+      window.removeEventListener('deviceorientation', onDeviceOrientation);
+    };
+  }, []);
+
+  useEffect(() => {
+    isMountedRef.current = true;
     if (!containerRef.current) return;
     const container = containerRef.current;
-    
-    let isMounted = true;
-    let renderer: THREE.WebGLRenderer | undefined;
-    let onWindowResize: (() => void) | null = null;
-    let currentSession: any = null;
-    let planesMap = new Map<any, THREE.Mesh>();
-    let scene = new THREE.Scene();
-    
-    try {
-        const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
-        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
-        light.position.set(0.5, 1, 0.25);
-        scene.add(light);
 
-        const wireframeGroup = new THREE.Group();
-        scene.add(wireframeGroup);
-        
-        // Add guidance animations group
-        const guidanceAnimGroup = new THREE.Group();
-        scene.add(guidanceAnimGroup);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+    const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+    light.position.set(0.5, 1, 0.25);
+    scene.add(light);
 
-        // Create a pulsing circle for the floor
-        const floorCircleGeom = new THREE.RingGeometry(0.3, 0.4, 32);
-        const floorCircleMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.8, side: THREE.DoubleSide });
-        const floorCircle = new THREE.Mesh(floorCircleGeom, floorCircleMat);
-        floorCircle.rotation.x = -Math.PI / 2;
-        floorCircle.visible = false;
-        guidanceAnimGroup.add(floorCircle);
-
-        // Create animated arrows to indicate panning
-        const arrowGeom = new THREE.ConeGeometry(0.05, 0.2, 8);
-        const arrowMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.8 });
-        const movingArrow = new THREE.Mesh(arrowGeom, arrowMat);
-        movingArrow.visible = false;
-        guidanceAnimGroup.add(movingArrow);
-
-    let frameCount = 0;
-
-    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    rendererRef.current = renderer;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
     renderer.xr.enabled = true;
     // renderer.xr.setFramebufferScaleFactor(window.devicePixelRatio);
     container.appendChild(renderer.domElement);
 
-    const startAR = async () => {
-        if (isWebXRRequesting) {
-            console.warn("WebXR is already requesting a session. Ignoring duplicate request.");
-            return;
-        }
-        
-        const xr = (navigator as any).xr;
-        if (!xr) {
-            if (isMounted) setIsSupported(false);
-            return;
-        }
-
-        isWebXRRequesting = true;
-
-        try {
-            const supported = await xr.isSessionSupported('immersive-ar');
-            if (!supported) {
-                if (isMounted) setIsSupported(false);
-                isWebXRRequesting = false;
-                return;
-            }
-        } catch (e) {
-            console.warn("isSessionSupported failed:", e);
-            if (isMounted) setIsSupported(false);
-            isWebXRRequesting = false;
-            return;
-        }
-
-        const overlayDiv = document.getElementById('ar-overlay');
-        
-        try {
-            const session = await xr.requestSession('immersive-ar', {
-                requiredFeatures: ['plane-detection'],
-                optionalFeatures: ['dom-overlay', 'local-floor', 'light-estimation', 'camera-access'],
-                domOverlay: overlayDiv ? { root: overlayDiv } : undefined
-            });
-            isWebXRRequesting = false;
-            if (!isMounted) {
-                session.end();
-                return;
-            }
-            renderer.xr.setReferenceSpaceType('local-floor');
-            await renderer.xr.setSession(session);
-            currentSession = session;
-            setIsSupported(true);
-        } catch (err: any) {
-            console.warn("AR Session error (full features):", err);
-            
-            if (err.message?.includes('already an active')) {
-                isWebXRRequesting = false;
-                return;
-            }
-
-            try {
-                // Fallback attempt without plane-detection as required
-                const fallbackSession = await xr.requestSession('immersive-ar', {
-                    optionalFeatures: ['dom-overlay', 'local-floor', 'light-estimation', 'camera-access'],
-                    domOverlay: overlayDiv ? { root: overlayDiv } : undefined
-                });
-                isWebXRRequesting = false;
-                if (!isMounted) {
-                    fallbackSession.end();
-                    return;
-                }
-                renderer.xr.setReferenceSpaceType('local-floor');
-                await renderer.xr.setSession(fallbackSession);
-                currentSession = fallbackSession;
-                setIsSupported(true);
-            } catch (fallbackErr: any) {
-                console.warn("AR Session fallback error with dom-overlay:", fallbackErr);
-                
-                try {
-                    // Final bare minimum fallback
-                    const bareSession = await xr.requestSession('immersive-ar', {
-                        optionalFeatures: ['local-floor', 'light-estimation']
-                    });
-                    isWebXRRequesting = false;
-                    if (!isMounted) {
-                        bareSession.end();
-                        return;
-                    }
-                    renderer.xr.setReferenceSpaceType('local-floor');
-                    await renderer.xr.setSession(bareSession);
-                    currentSession = bareSession;
-                    setIsSupported(true);
-                } catch (bareErr: any) {
-                    isWebXRRequesting = false;
-                    console.warn("AR Session bare fallback error:", bareErr);
-                    if (isMounted) setIsSupported(false);
-                }
-            }
-        }
+    const onSessionStart = () => {
+      clearSessionStartTimer(sessionStartTimerRef);
+      startRequestedRef.current = false;
+      if (!isMountedRef.current) return;
+      setIsSessionStarting(false);
+      setSessionStartError(null);
     };
-    
-    // We bind it to window so we can trigger it from React state easily without losing closure
-    (window as any)._startAR = startAR;
-    
-    // Try auto-starting if possible (sometimes works if transient activation carried over)
-    startAR().catch(() => {});
+    const onSessionEnd = () => {
+      sessionRef.current = null;
+      startRequestedRef.current = false;
+      depthActiveRef.current = false;
+      if (wakeLockRef.current) wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
+      updateScanQuality(stablePlaneCountRef.current, totalPlaneCountRef.current, performance.now(), true);
+      if (!isMountedRef.current) return;
+      setIsSessionStarting(false);
+    };
+    renderer.xr.addEventListener('sessionstart', onSessionStart);
+    renderer.xr.addEventListener('sessionend', onSessionEnd);
 
+    const planesMap = new Map<any, THREE.Mesh>();
+    let currentSession: XRSessionLike | null = null;
     let planeIdCounter = 0;
     let planeSupportChecked = false;
     let lastScanTime = Date.now();
@@ -204,93 +376,22 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     };
     window.addEventListener('resize', onWindowResize);
 
-    engineApiRef.current = {
-        getCurrentLighting: () => currentLighting
-    };
-
-    const animate = () => {
-      renderer.setAnimationLoop(render);
-    };
-
+    const planeGeometryVersion = new Map<any, number>();
     const render = (timestamp: number, frame: any) => {
       if (frame) {
-        currentSession = renderer.xr.getSession();
+        currentSession = renderer.xr.getSession() as XRSessionLike | null;
+        sessionRef.current = currentSession;
         const referenceSpace = renderer.xr.getReferenceSpace();
-
-        // Ensure the camera matches the device pose continuously
-        const viewerPose = frame.getViewerPose(referenceSpace);
-        if (viewerPose && viewerPose.views.length > 0) {
-            const view = viewerPose.views[0];
-            camera.position.set(view.transform.position.x, view.transform.position.y, view.transform.position.z);
-            camera.quaternion.set(view.transform.orientation.x, view.transform.orientation.y, view.transform.orientation.z, view.transform.orientation.w);
-            
-            // Keep the projection matrix synced too
-            camera.projectionMatrix.fromArray(view.projectionMatrix);
+        if (!referenceSpace) {
+          renderer.render(scene, camera);
+          return;
         }
 
-        // Request light probe once
-        if (currentSession && !lightProbeRequested && currentSession.requestLightProbe) {
-            lightProbeRequested = true;
-            currentSession.requestLightProbe({
-               reflectionFormat: currentSession.preferredReflectionFormat
-            }).then((probe: any) => {
-               xrLightProbe = probe;
-            }).catch((err: any) => console.warn("LightProbe failed", err));
-        }
+        const depthActive = hasDepthInformation(frame, referenceSpace);
+        if (depthActiveRef.current !== depthActive) depthActiveRef.current = depthActive;
 
-        // Update lighting estimate
-        if (xrLightProbe) {
-            const lightEstimate = frame.getLightEstimate(xrLightProbe);
-            if (lightEstimate) {
-                if (lightEstimate.primaryLightDirection) {
-                    const dir = lightEstimate.primaryLightDirection;
-                    currentLighting.primaryLightDirection = [dir.x, dir.y, dir.z];
-                }
-                if (lightEstimate.primaryLightIntensity) {
-                    const intensity = lightEstimate.primaryLightIntensity;
-                    // Usually an RGB representation of intensity
-                    const color = new THREE.Color(intensity.x, intensity.y, intensity.z);
-                    currentLighting.primaryLightColor = color.getHex();
-                    
-                    // Crude intensity calculation based on luminance
-                    currentLighting.primaryLightIntensity = Math.max(intensity.x, intensity.y, intensity.z);
-                }
-                
-                // Spherical harmonics are complex 9-bands, for simple ambient we just approximate 
-                // by using the length or components to derive ambient. We'll simplify to just taking 
-                // something proportional to the first band or just fixed if too complex.
-                if (lightEstimate.sphericalHarmonicsCoefficients) {
-                    const sh = lightEstimate.sphericalHarmonicsCoefficients;
-                    // The first 3 coefficients are typically the ambient term (L00)
-                    const ambientColor = new THREE.Color(
-                       Math.max(0, sh[0]),
-                       Math.max(0, sh[1]), 
-                       Math.max(0, sh[2])
-                    );
-                    currentLighting.ambientColor = ambientColor.getHex();
-                    currentLighting.ambientIntensity = Math.max(sh[0], sh[1], sh[2]);
-                }
-                
-                // Also update the THREE.js light used in the AR scene so we see the lighting affect the wireframes!
-                if (lightEstimate.primaryLightDirection && lightEstimate.primaryLightIntensity) {
-                    light.position.set(currentLighting.primaryLightDirection[0], currentLighting.primaryLightDirection[1], currentLighting.primaryLightDirection[2]);
-                    light.intensity = 0.5 + Math.min(1.0, currentLighting.primaryLightIntensity * 0.5);
-                }
-            }
-        }
-
-        if (!planeSupportChecked) {
-          planeSupportChecked = true;
-          if (frame.detectedPlanes === undefined) {
-             setIsSupported(false);
-          } else {
-             setIsSupported(true);
-          }
-        }
-
-        if (frame.detectedPlanes) {
-          const detectedPlanes = frame.detectedPlanes;
-          
+        const detectedPlanes = getDetectedPlaneSet(frame.detectedPlanes);
+        if (detectedPlanes) {
           detectedPlanes.forEach((plane: any) => {
             const pose = frame.getPose(plane.planeSpace, referenceSpace);
             if (!pose) return;
@@ -398,7 +499,10 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
 
             let mesh = planesMap.get(plane);
             if (!mesh) {
-              const material = new THREE.LineBasicMaterial({
+              const orientation = typeof plane.orientation === 'string' ? plane.orientation : 'unknown';
+              const isHoriz = orientation.toLowerCase() === 'horizontal';
+              const color = isHoriz ? 0x10b981 : 0x3b82f6;
+              const material = new THREE.MeshBasicMaterial({
                 color: color,
                 transparent: true,
                 opacity: 0.8,
@@ -409,170 +513,101 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
               
               scene.add(mesh);
               planesMap.set(plane, mesh);
-            } else {
-              mesh.visible = true;
-              (mesh.material as THREE.LineBasicMaterial).color.setHex(color);
-            }
 
-            mesh.position.copy(pose.transform.position);
-            mesh.quaternion.copy(pose.transform.orientation);
-            
-            // Only rebuild geometry if polygon changed size or every 30 frames to avoid memory exhaustion
-            const rebuildGeom = !mesh.userData.lastPolyLength || mesh.userData.lastPolyLength !== plane.polygon.length || (frameCount % 60 === 0);
-
-            const poly = [];
-            for (let i = 0; i < plane.polygon.length; i++) {
-              const p = plane.polygon[i];
-              poly.push({x: p.x, y: p.y, z: p.z});
-            }
-
-            if (rebuildGeom) {
-                mesh.userData.lastPolyLength = plane.polygon.length;
-                const points = [];
-                for (let i = 0; i < plane.polygon.length; i++) {
-                  const p = plane.polygon[i];
-                  points.push(new THREE.Vector3(p.x, 0, p.z));
-                }
-                const geom = new THREE.BufferGeometry().setFromPoints(points);
-                if (mesh.geometry) mesh.geometry.dispose();
-                mesh.geometry = geom;
-            }
-
-            let data = planesDataRef.current.get(plane);
-            if (!data) {
               planesDataRef.current.set(plane, {
                 id: planeIdCounter++,
-                orientation: plane.orientation,
-                semanticLabel: semanticClass,
+                orientation,
+                semanticLabel: plane.semanticLabel,
                 color: color,
-                polygon: poly,
-                position: {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z},
-                quaternion: {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w},
-                lastSeen: Date.now()
+                polygon: [],
+                position: {x: 0, y: 0, z: 0},
+                quaternion: {x: 0, y: 0, z: 0, w: 1},
+                hitCount: 0,
+                confidence: 0,
+                area: 0,
+                lastSeen: timestamp
               });
-            } else {
-              data.semanticLabel = semanticClass;
-              data.color = color;
-              
-              // Instead of overwriting polygon entirely, we let WebXR's plane tracking handle it 
-              // as this provides refined boundary updates over time, but we don't delete them.
-              data.polygon = poly;
-              
-              data.position = {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z};
-              data.quaternion = {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w};
-              data.lastSeen = Date.now();
+              setActivePlanesCount(planesMap.size);
+            }
+
+            let pose = null;
+            try {
+              pose = plane?.planeSpace ? frame.getPose(plane.planeSpace, referenceSpace) : null;
+            } catch (error) {
+              console.warn('Skipping plane with unavailable pose', error);
+            }
+
+            if (pose && mesh) {
+              mesh.position.copy(pose.transform.position);
+              mesh.quaternion.copy(pose.transform.orientation);
+
+              const poly: {x: number, y: number, z: number}[] = [];
+              const polygonPoints = plane?.polygon || [];
+              for (let i = 0; i < polygonPoints.length; i++) {
+                const p = polygonPoints[i];
+                if (Number.isFinite(p?.x) && Number.isFinite(p?.y) && Number.isFinite(p?.z)) {
+                  poly.push({x: p.x, y: p.y, z: p.z});
+                }
+              }
+
+              const currentVersion = plane.lastChangedTime ?? timestamp;
+              if (poly.length >= 3 && planeGeometryVersion.get(plane) !== currentVersion) {
+                try {
+                  const shape = new THREE.Shape();
+                  for (let i = 0; i < poly.length; i++) {
+                    const p = poly[i];
+                    if (i === 0) shape.moveTo(p.x, -p.z);
+                    else shape.lineTo(p.x, -p.z);
+                  }
+                  shape.closePath();
+                  const geom = new THREE.ShapeGeometry(shape);
+                  geom.rotateX(-Math.PI / 2); // align to WebXR plane local space (Y is normal)
+                  mesh.geometry?.dispose();
+                  mesh.geometry = geom;
+                  planeGeometryVersion.set(plane, currentVersion);
+                } catch (error) {
+                  console.warn('Skipping invalid plane geometry', error);
+                }
+              }
+
+              const data = planesDataRef.current.get(plane);
+              if (data) {
+                const area = polygonArea(poly);
+                const nextHitCount = (data.hitCount ?? 0) + 1;
+                const motionQuality = getMotionQuality(sensorSnapshotRef.current, sensorPermissionRef.current);
+
+                data.polygon = poly;
+                data.position = {x: pose.transform.position.x, y: pose.transform.position.y, z: pose.transform.position.z};
+                data.quaternion = {x: pose.transform.orientation.x, y: pose.transform.orientation.y, z: pose.transform.orientation.z, w: pose.transform.orientation.w};
+                data.area = area;
+                data.hitCount = nextHitCount;
+                data.lastSeen = timestamp;
+                data.confidence = getPlaneConfidence(area, nextHitCount, motionQuality, depthActiveRef.current);
+                data.sensor = sensorSnapshotRef.current || undefined;
+                data.depthActive = depthActiveRef.current;
+              }
             }
           });
 
-          // Keep stale planes to accumulate a scanned room, just hide their WebXR debug meshes if they aren't actively tracked
-          // Do not delete from `planesDataRef` to ensure merging/persistence across tracking angles.
-          const now = Date.now();
+          let removedPlane = false;
           planesMap.forEach((mesh, plane) => {
             if (!detectedPlanes.has(plane)) {
-              mesh.visible = false;
+              scene.remove(mesh);
+              disposePlaneMesh(mesh);
+              planesMap.delete(plane);
+              planeGeometryVersion.delete(plane);
+              planesDataRef.current.delete(plane);
+              removedPlane = true;
             }
           });
-          
-          const totalPlanes = planesDataRef.current.size;
 
-          if (frameCount % 15 === 0) {
-              setActivePlanesCount(totalPlanes);
-
-              let floorArea = 0;
-              let wallArea = 0;
-              let ceilingArea = 0;
-              let featureCount = 0;
-              let floorFound = false;
-              let ceilingFound = false;
-              let wallCount = 0;
-              let minY = Infinity;
-              let maxY = -Infinity;
-
-              planesDataRef.current.forEach((p) => {
-                 let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-                 let pMinY = Infinity, pMaxY = -Infinity;
-                 p.polygon.forEach(pt => {
-                    minX = Math.min(minX, pt.x);
-                    maxX = Math.max(maxX, pt.x);
-                    minZ = Math.min(minZ, pt.z);
-                    maxZ = Math.max(maxZ, pt.z);
-                 });
-                 // Position is the center point tracked by WebXR, we estimate height based on this
-                 pMinY = Math.min(pMinY, p.position.y);
-                 pMaxY = Math.max(pMaxY, p.position.y);
-                 minY = Math.min(minY, pMinY);
-                 maxY = Math.max(maxY, pMaxY);
-
-                 const areaApprox = (maxX - minX) * (maxZ - minZ);
-
-                 if (p.semanticLabel === 'floor') {
-                     floorFound = true;
-                     floorArea += areaApprox;
-                 } else if (p.semanticLabel === 'ceiling') {
-                     ceilingFound = true;
-                     ceilingArea += areaApprox;
-                 } else if (p.semanticLabel === 'wall') {
-                     wallCount++;
-                     wallArea += areaApprox;
-                 } else if (p.semanticLabel === 'door' || p.semanticLabel === 'window') {
-                     featureCount++;
-                 }
-              });
-
-              // Fallback height estimation if ceiling or floor not explicitly labeled but present across vertical extent
-              let estHeight = 0;
-              if (maxY !== -Infinity && minY !== Infinity) {
-                  estHeight = maxY - minY;
-                  if (!ceilingFound && estHeight < 1.5) estHeight = 2.5; // Assume default if we only mapped floor
-              }
-
-              setScanStats({ floorArea, wallArea, ceilingArea, featureCount, roomHeight: estHeight });
-
-              if (now - lastScanTime > 2000) {
-                 const addedPlanes = totalPlanes - lastPlaneCount;
-                 if (addedPlanes === 0 && totalPlanes > 0 && totalPlanes < 10) {
-                     slowProgressCount++;
-                 } else {
-                     slowProgressCount = 0;
-                 }
-                 lastScanTime = now;
-                 lastPlaneCount = totalPlanes;
-              }
-
-              if (slowProgressCount > 0 && floorArea < 1.0) {
-                 setGuidanceTip('Too few planes detected. Move slower and ensure good lighting.');
-                 setGuidanceIcon(<Info className="w-8 h-8 md:w-12 md:h-12" />);
-                 setScanQuality('low');
-              } else if (slowProgressCount > 1 && (wallCount < 4 || wallArea < 10.0)) {
-                 setGuidanceTip('Scan corners where walls meet to establish room shape.');
-                 setGuidanceIcon(<Compass className="w-8 h-8 md:w-12 md:h-12 animate-pulse" />);
-                 setScanQuality('medium');
-              } else if (!floorFound || floorArea < 1.0) {
-                 setGuidanceTip('Point at the floor and move slowly to map it.');
-                 setGuidanceIcon(<ArrowDown className="w-8 h-8 md:w-12 md:h-12" />);
-                 setScanQuality('low');
-              } else if (wallCount < 2 || wallArea < 3.0) {
-                 setGuidanceTip('Pan up and around to map the walls.');
-                 setGuidanceIcon(<RefreshCw className="w-8 h-8 md:w-12 md:h-12 animate-spin-slow" />);
-                 setScanQuality('medium');
-              } else if (wallCount < 4 || wallArea < 10.0) {
-                 setGuidanceTip('Look for other wall corners and capture their full height.');
-                 setGuidanceIcon(<Compass className="w-8 h-8 md:w-12 md:h-12" />);
-                 setScanQuality('medium');
-              } else if (!ceilingFound && ceilingArea < 1.0 && wallCount >= 3) {
-                 setGuidanceTip('Look up to scan the ceiling.');
-                 setGuidanceIcon(<ArrowDown className="w-8 h-8 md:w-12 md:h-12 rotate-180" />);
-                 setScanQuality('medium');
-              } else if (featureCount < 1) {
-                 setGuidanceTip('Room shape captured. Point at doors and windows to detect them.');
-                 setGuidanceIcon(<Check className="w-8 h-8 md:w-12 md:h-12" />);
-                 setScanQuality('high');
-              } else {
-                 setGuidanceTip('Great! Tap Finish Mapping when you are ready.');
-                 setGuidanceIcon(<Check className="w-8 h-8 md:w-12 md:h-12 text-emerald-400" />);
-                 setScanQuality('high');
-              }
-          }
+          const stablePlanes = Array.from(planesDataRef.current.values()).filter((plane) =>
+            (plane.hitCount ?? 0) >= STABLE_PLANE_HITS &&
+            (plane.area ?? 0) >= MIN_PLANE_AREA_M2 &&
+            (plane.confidence ?? 0) >= 45
+          ).length;
+          if (removedPlane) setActivePlanesCount(planesMap.size);
+          updateScanQuality(stablePlanes, planesMap.size, timestamp);
         }
       }
 
@@ -700,91 +735,229 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
       renderer.render(scene, camera);
     };
 
-    animate();
-    } catch (err) { console.error("AR Start error", err); }
+    renderer.setAnimationLoop(render);
 
     return () => {
-      isMounted = false;
-      if (onWindowResize) {
-        window.removeEventListener('resize', onWindowResize);
-      }
-      if (renderer) {
-        renderer.setAnimationLoop(null);
-        renderer.dispose();
-        if (container && renderer.domElement && container.contains(renderer.domElement)) {
-          container.removeChild(renderer.domElement);
-        }
-      }
-      if (currentSession) {
-        currentSession.end().catch(() => {});
-      }
-      if (planesMap) {
-        planesMap.forEach((mesh) => {
-            mesh.geometry?.dispose();
-            (mesh.material as THREE.Material)?.dispose();
-        });
-      }
-      if (scene) {
-        scene.clear();
-      }
+      isMountedRef.current = false;
+      clearSessionStartTimer(sessionStartTimerRef);
+      const activeSession = currentSession || sessionRef.current;
+      rendererRef.current = null;
+      sessionRef.current = null;
+      renderer.xr.removeEventListener('sessionstart', onSessionStart);
+      renderer.xr.removeEventListener('sessionend', onSessionEnd);
+      window.removeEventListener('resize', onWindowResize);
+      renderer.setAnimationLoop(null);
+      if (activeSession) activeSession.end().catch(() => {});
+      if (wakeLockRef.current) wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
+      planesMap.forEach(disposePlaneMesh);
+      renderer.dispose();
+      scene.clear();
+      if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
     };
   }, []);
 
-  const handleFinish = () => {
-      const planesArray = Array.from(planesDataRef.current.values());
-      const lighting = engineApiRef.current?.getCurrentLighting();
-      onComplete(planesArray, 1.0, lighting);
+  const requestMobileSensorAccess = async () => {
+    const motionEvent = window.DeviceMotionEvent as PermissionCapableEvent | undefined;
+    const orientationEvent = window.DeviceOrientationEvent as PermissionCapableEvent | undefined;
+
+    if (!motionEvent && !orientationEvent) {
+      sensorPermissionRef.current = 'unsupported';
+      updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes);
+      return;
+    }
+
+    const permissionRequests = [motionEvent, orientationEvent]
+      .map((eventConstructor) => eventConstructor?.requestPermission)
+      .filter((requestPermission): requestPermission is () => Promise<'granted' | 'denied'> => Boolean(requestPermission))
+      .map((requestPermission) => requestPermission());
+
+    if (permissionRequests.length === 0) {
+      sensorPermissionRef.current = 'granted';
+      updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes);
+      return;
+    }
+
+    try {
+      const results = await Promise.all(permissionRequests);
+      sensorPermissionRef.current = results.every((result) => result === 'granted') ? 'granted' : 'denied';
+    } catch (error) {
+      console.warn('Unable to request mobile motion sensors', error);
+      sensorPermissionRef.current = 'denied';
+    }
+
+    updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes);
   };
 
-  const getQualityColor = () => {
-     if (scanQuality === 'low') return 'text-red-400 border-red-500/50 bg-red-500/20 shadow-[0_0_30px_-5px_rgba(239,68,68,0.3)]';
-     if (scanQuality === 'medium') return 'text-yellow-400 border-yellow-500/50 bg-yellow-500/20 shadow-[0_0_30px_-5px_rgba(234,179,8,0.3)]';
-     return 'text-emerald-400 border-emerald-500/50 bg-emerald-500/20 shadow-[0_0_30px_-5px_rgba(16,185,129,0.3)]';
+  const requestWakeLock = async () => {
+    const wakeLock = (navigator as Navigator & { wakeLock?: { request: (type: 'screen') => Promise<WakeLockSentinelLike> } }).wakeLock;
+    if (!wakeLock?.request || wakeLockRef.current) return;
+
+    try {
+      const sentinel = await wakeLock.request('screen');
+      const onRelease = () => {
+        wakeLockRef.current = null;
+        updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes, performance.now(), true);
+      };
+      sentinel.addEventListener?.('release', onRelease);
+      wakeLockRef.current = sentinel;
+      updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes, performance.now(), true);
+    } catch (error) {
+      console.warn('Unable to request screen wake lock', error);
+    }
+  };
+
+  const handleStartSession = async () => {
+    if (startRequestedRef.current || sessionRef.current) return;
+
+    const xr = getXRSystem();
+    const renderer = rendererRef.current;
+    const overlayDiv = document.getElementById('ar-overlay');
+
+    if (!xr?.requestSession || !renderer) {
+      setIsSessionStarting(false);
+      setSessionStartError('WebXR AR is not available in this browser. Use the native LiDAR/RoomPlan or ARCore Depth mode for production mobile capture.');
+      startRequestedRef.current = false;
+      return;
+    }
+
+    startRequestedRef.current = true;
+    setIsSessionStarting(true);
+    setSessionStartError(null);
+
+    await requestMobileSensorAccess();
+    await requestWakeLock();
+
+    const sessionInit: Record<string, unknown> = {
+      requiredFeatures: ['plane-detection'],
+      optionalFeatures: [
+        ...(overlayDiv ? ['dom-overlay'] : []),
+        'depth-sensing',
+        'hit-test',
+        'anchors',
+        'light-estimation'
+      ],
+      depthSensing: {
+        usagePreference: ['cpu-optimized', 'gpu-optimized'],
+        dataFormatPreference: ['luminance-alpha', 'float32']
+      }
+    };
+    if (overlayDiv) sessionInit.domOverlay = { root: overlayDiv };
+
+    renderer.xr.setReferenceSpaceType('local');
+
+    sessionStartTimerRef.current = window.setTimeout(() => {
+      if (!isMountedRef.current || !startRequestedRef.current) return;
+      setSessionStartError('Still waiting for AR permission. Please approve camera/motion prompts to continue.');
+    }, SESSION_START_TIMEOUT_MS);
+
+    try {
+      const session = await xr.requestSession('immersive-ar', sessionInit);
+      sessionRef.current = session;
+
+      try {
+        await renderer.xr.setSession(session as any);
+      } catch (error) {
+        sessionRef.current = null;
+        await session.end().catch(() => {});
+        throw error;
+      }
+
+      clearSessionStartTimer(sessionStartTimerRef);
+      startRequestedRef.current = false;
+      if (!isMountedRef.current) return;
+      setIsSessionStarting(false);
+      setSessionStartError(null);
+    } catch (error) {
+      console.warn('Unable to start AR scan session', error);
+      clearSessionStartTimer(sessionStartTimerRef);
+      sessionRef.current = null;
+      startRequestedRef.current = false;
+      if (wakeLockRef.current) {
+        await wakeLockRef.current.release().catch(() => {});
+        wakeLockRef.current = null;
+      }
+      if (!isMountedRef.current) return;
+      setIsSessionStarting(false);
+      setSessionStartError(getSessionErrorMessage(error));
+      updateScanQuality(scanQualityRef.current.stablePlanes, scanQualityRef.current.totalPlanes, performance.now(), true);
+    }
+  };
+
+  const handleFinish = () => {
+      const planesArray = Array.from(planesDataRef.current.values());
+      const stablePlanes = planesArray.filter((plane) =>
+        (plane.hitCount ?? 0) >= STABLE_PLANE_HITS &&
+        (plane.area ?? 0) >= MIN_PLANE_AREA_M2 &&
+        (plane.confidence ?? 0) >= 45
+      );
+      onComplete(stablePlanes.length > 0 ? stablePlanes : planesArray);
   };
 
   return (
     <>
-      <div ref={containerRef} className="fixed inset-0 w-full h-[100dvh] touch-none" />
-      <div 
-        id="ar-overlay" 
-        className="fixed inset-0 pointer-events-none z-50"
-      >
-        <div 
-          className="w-full h-full flex flex-col justify-between p-6 overflow-hidden box-border"
-          style={{ 
-            paddingTop: 'calc(env(safe-area-inset-top, 24px) + 1.5rem)',
-            paddingBottom: 'calc(env(safe-area-inset-bottom, 24px) + 1.5rem)'
-          }}
-        >
-          <div className="flex justify-between items-start z-10 w-full">
-           <div className="space-y-4 pointer-events-auto">
-             <div className="bg-black/50 backdrop-blur w-44 text-white px-4 py-3 rounded-xl border border-white/10 shadow-lg flex flex-col gap-2">
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Planes</span>
-                   <span className="text-white font-mono">{activePlanesCount}</span>
+      <div ref={containerRef} className="absolute inset-0 bg-black touch-none" />
+      <div id="ar-overlay" className="absolute inset-0 pointer-events-none z-50 flex flex-col justify-between p-6">
+        <div className="flex justify-between items-start gap-4">
+           <div className="space-y-4 pointer-events-auto max-w-xs">
+             <Button
+               onClick={handleStartSession}
+               disabled={isSessionStarting}
+               className="bg-indigo-600 hover:bg-indigo-500 text-white w-full"
+             >
+               <Scan className="w-5 h-5 mr-2" />
+               {isSessionStarting ? 'Starting AR + sensors…' : 'Start Professional Scan'}
+             </Button>
+             {sessionStartError && (
+               <p className="text-xs text-amber-300 bg-amber-500/10 border border-amber-400/30 rounded-lg px-3 py-2">
+                 {sessionStartError}
+               </p>
+             )}
+             <div className="bg-black/50 backdrop-blur text-white px-4 py-3 rounded-xl border border-white/10 shadow-lg space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs text-slate-300 font-semibold uppercase tracking-wider">Detected Surfaces</div>
+                    <div className="text-3xl font-bold font-mono">{activePlanesCount}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xs text-slate-300 font-semibold uppercase tracking-wider">Stable</div>
+                    <div className="text-3xl font-bold font-mono text-emerald-300">{scanQuality.stablePlanes}</div>
+                  </div>
                 </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Floor Area</span>
-                   <span className="text-emerald-400 font-mono">{scanStats.floorArea.toFixed(1)} m²</span>
+                <div className="grid grid-cols-2 gap-2 text-xs text-slate-200">
+                  <div className="rounded-lg bg-white/5 px-3 py-2">
+                    <div className="flex items-center gap-1 text-slate-400"><Gauge className="w-3 h-3" /> Motion</div>
+                    <div className={scanQuality.motionQuality === 'too-fast' ? 'text-amber-300 font-semibold' : 'text-emerald-300 font-semibold'}>
+                      {scanQuality.motionQuality.replace('-', ' ')}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-white/5 px-3 py-2">
+                    <div className="flex items-center gap-1 text-slate-400"><Activity className="w-3 h-3" /> IMU</div>
+                    <div className={scanQuality.sensorPermission === 'granted' ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
+                      {scanQuality.sensorPermission}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-white/5 px-3 py-2">
+                    <div className="text-slate-400">Depth</div>
+                    <div className={scanQuality.depthActive ? 'text-emerald-300 font-semibold' : 'text-slate-300 font-semibold'}>
+                      {scanQuality.depthActive ? 'active' : 'optional'}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-white/5 px-3 py-2">
+                    <div className="text-slate-400">Screen</div>
+                    <div className={scanQuality.wakeLockActive ? 'text-emerald-300 font-semibold' : 'text-slate-300 font-semibold'}>
+                      {scanQuality.wakeLockActive ? 'awake' : 'normal'}
+                    </div>
+                  </div>
                 </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Ceiling Area</span>
-                   <span className="text-cyan-400 font-mono">{scanStats.ceilingArea.toFixed(1)} m²</span>
-                </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Wall Area</span>
-                   <span className="text-blue-400 font-mono">{scanStats.wallArea.toFixed(1)} m²</span>
-                </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Height</span>
-                   <span className="text-rose-400 font-mono">{scanStats.roomHeight > 0.1 ? scanStats.roomHeight.toFixed(2) + 'm' : '--'}</span>
-                </div>
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex justify-between">
-                   <span>Features</span>
-                   <span className="text-purple-400 font-mono">{scanStats.featureCount}</span>
-                </div>
+                <p className="text-xs text-slate-300 leading-relaxed">{scanQuality.message}</p>
              </div>
-             
+             <div className="bg-indigo-500/10 border border-indigo-400/20 rounded-xl px-4 py-3 text-xs text-indigo-100 leading-relaxed">
+               <div className="flex items-center gap-2 font-semibold text-indigo-200 mb-1">
+                 <ShieldCheck className="w-4 h-4" /> Professional path
+               </div>
+               Browser WebXR can fuse camera planes with IMU guidance. For highest accuracy, capture with native iOS RoomPlan/LiDAR or Android ARCore Depth and import the result here.
+             </div>
              <Button variant="outline" className="bg-black/50 border-white/10 text-white w-full" onClick={onCancel}>
                <X className="w-5 h-5 mr-2" /> Cancel
              </Button>
@@ -802,44 +975,11 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
              </div>
            )}
         </div>
-
-        {/* Central Guidance UI */}
-        {isSupported && (
-           <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none opacity-80 backdrop-blur-sm bg-black/10 transition-opacity duration-500">
-              <div className={`p-6 rounded-full border mb-6 transition-all duration-1000 ${getQualityColor()}`}>
-                 {guidanceIcon}
-              </div>
-           </div>
-        )}
-
-         <div className="text-center pb-8 pointer-events-none z-10 space-y-4">
-            {isSupported === null && (
-               <Button 
-                  onClick={() => {
-                     if ((window as any)._startAR) (window as any)._startAR();
-                  }}
-                  className="bg-indigo-600 hover:bg-indigo-500 text-white pointer-events-auto shadow-lg px-8 py-6 rounded-full font-bold text-lg"
-               >
-                 Tap to Open Camera
-               </Button>
-            )}
-            {isSupported === false ? (
-               <p className="bg-red-500/80 inline-flex flex-col items-center gap-2 px-4 py-3 rounded-xl text-white text-sm backdrop-blur font-medium border border-red-400/50 max-w-sm pointer-events-auto">
-                   <span className="flex items-center gap-2">
-                       <Info className="w-5 h-5 flex-shrink-0" />
-                       WebXR AR session failed to start.
-                   </span>
-                   <span className="text-red-200 text-xs text-center">
-                       If you are in a preview window, please open the app in a new tab. Otherwise, check your site permissions.
-                   </span>
-               </p>
-            ) : isSupported === true ? (
-                <p className={`inline-flex items-center gap-2 px-6 py-4 rounded-full text-white text-sm md:text-base backdrop-blur font-medium border transition-all duration-500 ${scanQuality === 'high' ? 'bg-emerald-500/20 border-emerald-500/30' : 'bg-black/60 border-white/10'}`}>
-                    {scanQuality === 'high' ? <Check className="w-5 h-5 text-emerald-400" /> : <Info className="w-5 h-5 text-indigo-400" />}
-                    {guidanceTip}
-                </p>
-            ) : null}
-         </div>
+        <div className="text-center pb-8 pointer-events-none">
+            <p className="bg-black/60 inline-flex items-center gap-2 px-4 py-3 rounded-full text-white text-sm backdrop-blur font-medium border border-white/10">
+                <RotateCcw className="w-5 h-5 text-indigo-400" />
+                Pan slowly, pause on corners, and keep motion quality green
+            </p>
         </div>
       </div>
     </>

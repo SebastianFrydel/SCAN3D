@@ -112,23 +112,42 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
       return null;
   };
 
-  const modelData = useMemo(() => {
-    const rawPlanes: RawPlane[] = planes.map(p => ({
-        ...p,
-        polygon: p.polygon,
-        position: new THREE.Vector3(p.position.x, p.position.y, p.position.z),
-        quaternion: new THREE.Quaternion(p.quaternion.x, p.quaternion.y, p.quaternion.z, p.quaternion.w)
-    }));
+  const scanStats = useMemo(() => {
+    const confidentPlanes = planes.filter((plane) => (plane.confidence ?? 0) >= 45);
+    const averageConfidence = planes.length
+      ? planes.reduce((sum, plane) => sum + (plane.confidence ?? 0), 0) / planes.length
+      : 0;
+    const sensorSamples = planes.filter((plane) => plane.sensor).length;
+    const depthSamples = planes.filter((plane) => plane.depthActive).length;
 
-    const model = RoomReconstruction.buildRoomModel(rawPlanes);
+    return {
+      confidentPlanes: confidentPlanes.length,
+      averageConfidence,
+      sensorSamples,
+      depthSamples
+    };
+  }, [planes]);
 
-    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    model.floorHullPoints.forEach(p => {
-        minX = Math.min(minX, p.x);
-        maxX = Math.max(maxX, p.x);
-        minZ = Math.min(minZ, p.z);
-        maxZ = Math.max(maxZ, p.z);
-    });
+  // Process data for the enhanced view
+  const { enhancedWalls, floorHull, ceilingHull, floorY, ceilingY, roomCenter } = useMemo(() => {
+    let globalMinY = Infinity;
+    let globalMaxY = -Infinity;
+
+    const globalPlanes = planes.map(plane => {
+        const matrix = new THREE.Matrix4().compose(
+            new THREE.Vector3(plane.position.x, plane.position.y, plane.position.z),
+            new THREE.Quaternion(plane.quaternion.x, plane.quaternion.y, plane.quaternion.z, plane.quaternion.w),
+            new THREE.Vector3(1, 1, 1)
+        );
+        const globalPoints = plane.polygon.map(p => {
+            return new THREE.Vector3(p.x, p.y, p.z).applyMatrix4(matrix);
+        });
+
+        let minY = Infinity, maxY = -Infinity;
+        globalPoints.forEach(p => {
+            minY = Math.min(minY, p.y);
+            maxY = Math.max(maxY, p.y);
+        });
 
     return { 
         enhancedWalls: model.enhancedWalls, 
@@ -327,24 +346,22 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
                 });
             }
 
-            const extrudeSettings = { depth: 0.1, bevelEnabled: false };
-            let wallGeom: THREE.BufferGeometry;
-            try {
-                wallGeom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-            } catch (e) {
-                wallGeom = new THREE.PlaneGeometry(w.width, w.height);
-            }
-            wallGeom.translate(0, 0, -0.05);
+    const hull = getConvexHull(allXZPoints);
+    let rCX = 0, rCZ = 0;
 
-            // Correct UV maps for physical walls
-            const posAttr = wallGeom.attributes.position;
-            const uvAttr = wallGeom.attributes.uv;
-            if (posAttr && uvAttr) {
-                for (let i = 0; i < posAttr.count; i++) {
-                   const x = posAttr.getX(i);
-                   const y = posAttr.getY(i);
-                   uvAttr.setXY(i, x, y);
-                }
+    // Create shapes for hull
+    let floorShape = new THREE.Shape();
+    let ceilShape = new THREE.Shape();
+    if (hull.length >= 3) {
+        hull.forEach((p, i) => {
+            rCX += p.x;
+            rCZ += p.z;
+            if (i === 0) {
+                floorShape.moveTo(p.x, -p.z);
+                ceilShape.moveTo(p.x, -p.z);
+            } else {
+                floorShape.lineTo(p.x, -p.z);
+                ceilShape.lineTo(p.x, -p.z);
             }
 
             const wMatType = customMaterials[w.id] || 'defaultWall';
@@ -396,37 +413,43 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
 
             sceneGroupRef.current?.add(wallGroup);
         });
+        rCX /= hull.length;
+        rCZ /= hull.length;
+    } else { // fallback
+       floorShape.moveTo(-1, -1); floorShape.lineTo(1, -1); floorShape.lineTo(1, 1); floorShape.lineTo(-1, 1);
+       ceilShape.moveTo(-1, -1); ceilShape.lineTo(1, -1); ceilShape.lineTo(1, 1); ceilShape.lineTo(-1, 1);
+    }
 
-        // Furniture/Objects placements
-        if (objects) {
-            objects.forEach(o => {
-                let color = 0xf59e0b;
-                if (o.type === 'chair') color = 0xf43f5e;
-                if (o.type === 'sofa') color = 0xd946ef;
-                if (o.type === 'wardrobe') color = 0xf97316;
-                if (o.type === 'tv') color = 0x14b8a6;
+    const fGeom = new THREE.ShapeGeometry(floorShape);
+    fGeom.rotateX(-Math.PI / 2); // local flat to XZ
+    const cGeom = new THREE.ShapeGeometry(ceilShape);
+    cGeom.rotateX(-Math.PI / 2);
 
-                const geom = new THREE.BoxGeometry(o.width, o.height, o.depth);
-                const isSelected = selectedMeshId === o.id;
+    const enhancedWallsData: { id: string, width: number, height: number, position: [number, number, number], quaternion: [number, number, number, number], color: number }[] = [];
+    if (hull.length >= 3) {
+        for (let i = 0; i < hull.length; i++) {
+            const p1 = hull[i];
+            const p2 = hull[(i + 1) % hull.length];
 
-                const mat = new THREE.MeshPhysicalMaterial({
-                    color: isSelected ? 0x94a3b8 : color,
-                    transparent: true,
-                    opacity: 0.7,
-                    roughness: 0.5,
-                    metalness: 0.1
-                });
+            const dx = p2.x - p1.x;
+            const dz = p2.z - p1.z;
+            const width = Math.hypot(dx, dz);
+            const height = cY - fY;
 
-                const mesh = new THREE.Mesh(geom, mat);
-                mesh.position.set(o.position[0], o.position[1], o.position[2]);
-                mesh.quaternion.set(o.quaternion[0], o.quaternion[1], o.quaternion[2], o.quaternion[3]);
-                mesh.userData = { id: o.id, type: 'object' };
-                sceneGroupRef.current?.add(mesh);
-                raycastableMeshes.push(mesh);
+            const midX = (p1.x + p2.x) / 2;
+            const midZ = (p1.z + p2.z) / 2;
+            const cy = (cY + fY) / 2;
 
-                const edges = new THREE.EdgesGeometry(geom);
-                const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: isSelected ? 0xffffff : color, linewidth: 2 }));
-                mesh.add(line);
+            const theta = -Math.atan2(dz, dx);
+            const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), theta);
+
+            enhancedWallsData.push({
+                id: 'hull_wall_' + i,
+                width,
+                height,
+                position: [midX, cy, midZ] as [number, number, number],
+                quaternion: [quat.x, quat.y, quat.z, quat.w] as [number, number, number, number],
+                color: 0x3b82f6
             });
         }
 
@@ -455,121 +478,57 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
         }
     }
 
-    // RAYCASTING click logic
-    const handlePointerDown = (event: PointerEvent) => {
-        // Calculate canvas coordinates
-        const rect = renderer.domElement.getBoundingClientRect();
-        const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-        const y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-        const raycaster = new THREE.Raycaster();
-        raycaster.setFromCamera(new THREE.Vector2(x, y), camera);
-        const intersects = raycaster.intersectObjects(raycastableMeshes);
-
-        if (intersects.length > 0) {
-            const hit = intersects[0].object;
-            if (hit.userData && hit.userData.id) {
-                setSelectedMeshId(hit.userData.id);
-            }
-        } else {
-            // Did not hit any paintable meshes
-            setSelectedMeshId(null);
-        }
+    return {
+        enhancedWalls: enhancedWallsData,
+        floorHull: fGeom,
+        ceilingHull: cGeom,
+        floorY: fY,
+        ceilingY: cY,
+        roomCenter: [rCX, 0, rCZ] as [number, number, number]
     };
-    renderer.domElement.addEventListener('pointerdown', handlePointerDown);
+  }, [planes]);
 
-    // ANIMATION Loop
-    let animationFrameId: number;
-    const animate = () => {
-        animationFrameId = requestAnimationFrame(animate);
-        controls.update();
-        renderer.render(scene, camera);
-    };
-    animate();
+  const rawPlaneMeshes = useMemo(() => {
+    return planes.map(plane => {
+      const shape = new THREE.Shape();
+      for (let i = 0; i < plane.polygon.length; i++) {
+        const p = plane.polygon[i];
+        if (i === 0) shape.moveTo(p.x, -p.z);
+        else shape.lineTo(p.x, -p.z);
+      }
+      const geom = new THREE.ShapeGeometry(shape);
+      geom.rotateX(-Math.PI / 2);
 
-    // RESIZE Listener
-    const onWindowResize = () => {
-        camera.aspect = container.clientWidth / container.clientHeight;
-        camera.updateProjectionMatrix();
-        renderer.setSize(container.clientWidth, container.clientHeight);
-    };
-    window.addEventListener('resize', onWindowResize);
+      return {
+        id: plane.id,
+        geometry: geom,
+        position: [plane.position.x, plane.position.y, plane.position.z] as [number, number, number],
+        quaternion: [plane.quaternion.x, plane.quaternion.y, plane.quaternion.z, plane.quaternion.w] as [number, number, number, number],
+        color: plane.color,
+      };
+    });
+  }, [planes]);
+
+  const enhancedWallGeometries = useMemo(() => {
+    return enhancedWalls.map(w => ({
+      id: w.id,
+      geometry: new THREE.PlaneGeometry(w.width, w.height)
+    }));
+  }, [enhancedWalls]);
+  const enhancedWallGeometryMap = useMemo(() => {
+    return new Map(enhancedWallGeometries.map((wg) => [wg.id, wg.geometry]));
+  }, [enhancedWallGeometries]);
 
     // CLEANUP
     return () => {
-        cancelAnimationFrame(animationFrameId);
-        window.removeEventListener('resize', onWindowResize);
-        if (renderer.domElement && renderer.domElement.parentNode) {
-            renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
-            renderer.dispose();
-            container.removeChild(renderer.domElement);
-        }
-        scene.clear();
+      floorHull.dispose();
+      ceilingHull.dispose();
+      rawPlaneMeshes.forEach((pm) => pm.geometry.dispose());
+      enhancedWallGeometries.forEach((wg) => {
+        wg.geometry.dispose();
+      });
     };
-  }, [viewMode, planes, customMaterials, selectedMeshId, roomCenter, ceilingY, floorY, lighting]);
-
-  // Handle high precision exports
-  const handleExportGLTF = () => {
-      if (!sceneGroupRef.current) return;
-      const exporter = new GLTFExporter();
-      exporter.parse(
-          sceneGroupRef.current,
-          (gltf) => {
-              const output = JSON.stringify(gltf, null, 2);
-              const blob = new Blob([output], { type: 'text/plain' });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = 'ar_room.gltf';
-              a.click();
-              URL.revokeObjectURL(url);
-          },
-          (error) => {
-              console.error('GLTF Export Failed', error);
-          },
-          { binary: false }
-      );
-  };
-
-  const handleExportOBJ = () => {
-      if (!sceneGroupRef.current) return;
-      const exporter = new OBJExporter();
-      const output = exporter.parse(sceneGroupRef.current);
-      const blob = new Blob([output], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'ar_room.obj';
-      a.click();
-      URL.revokeObjectURL(url);
-  };
-
-  const handleExportSTL = () => {
-      if (!sceneGroupRef.current) return;
-      const exporter = new STLExporter();
-      const output = exporter.parse(sceneGroupRef.current, { binary: true });
-      const blob = new Blob([output], { type: 'application/octet-stream' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'ar_room.stl';
-      a.click();
-      URL.revokeObjectURL(url);
-  };
-
-  const handleExportPLY = () => {
-      if (!sceneGroupRef.current) return;
-      const exporter = new PLYExporter();
-      exporter.parse(sceneGroupRef.current, (output) => {
-          const blob = new Blob([output], { type: 'text/plain' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'ar_room.ply';
-          a.click();
-          URL.revokeObjectURL(url);
-      }, { binary: false });
-  };
+  }, [floorHull, ceilingHull, rawPlaneMeshes, enhancedWallGeometries]);
 
   const handleApplyMaterial = (matType: MaterialType) => {
       if (selectedMeshId) {
@@ -581,34 +540,25 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
   };
 
   return (
-    <div className="fixed inset-0 w-full h-[100dvh] bg-slate-900 flex flex-col">
-      <div 
-        className="absolute top-0 inset-x-0 p-4 md:p-6 flex flex-col md:flex-row justify-between items-start z-10 pointer-events-none gap-4"
-        style={{ paddingTop: 'calc(env(safe-area-inset-top, 24px) + 1rem)' }}
-      >
-        <div className="flex gap-2 shrink-0 pointer-events-auto">
-          <Button variant="outline" className="bg-black/50 border-white/10 text-white hover:bg-black/70 shadow-lg" onClick={onBack}>
-            <ArrowLeft className="w-5 h-5 mr-2" />
-            Rescan Room
-          </Button>
-          <Button variant="default" className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg border-0 font-semibold" onClick={() => setShowAIInsights(true)}>
-            <Sparkles className="w-5 h-5 mr-2" />
-            AI Insights
-          </Button>
-        </div>
-        
+    <div className="absolute inset-0 bg-slate-900 flex flex-col">
+      <div className="absolute top-0 inset-x-0 p-4 md:p-6 flex flex-col md:flex-row justify-between items-start z-10 pointer-events-none gap-4">
+        <Button variant="outline" className="bg-black/50 border-white/10 text-white hover:bg-black/70 pointer-events-auto shadow-lg shrink-0" onClick={onBack}>
+          <ArrowLeft className="w-5 h-5 mr-2" />
+          Rescan Room
+        </Button>
+
         <div className="flex flex-wrap md:flex-nowrap gap-2 pointer-events-auto w-full md:w-auto">
            <div className="flex gap-2 shrink-0">
-               <Button 
-                  variant={viewMode === 'raw' ? 'default' : 'outline'} 
+               <Button
+                  variant={viewMode === 'raw' ? 'default' : 'outline'}
                   className={`shadow-lg transition-all ${viewMode === 'raw' ? 'bg-indigo-600 hover:bg-indigo-500 border-0' : 'bg-black/50 border-white/10 text-white hover:bg-black/70'}`}
                   onClick={() => { setViewMode('raw'); setSelectedMeshId(null); }}
                >
                   <Layers className="w-4 h-4 mr-2 hidden sm:block" />
                   Raw
                </Button>
-               <Button 
-                  variant={viewMode === 'enhanced' ? 'default' : 'outline'} 
+               <Button
+                  variant={viewMode === 'enhanced' ? 'default' : 'outline'}
                   className={`shadow-lg transition-all ${viewMode === 'enhanced' ? 'bg-indigo-600 hover:bg-indigo-500 border-0' : 'bg-black/50 border-white/10 text-white hover:bg-black/70'}`}
                   onClick={() => setViewMode('enhanced')}
                >
@@ -665,9 +615,19 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
         </div>
 
         <div className="bg-black/50 backdrop-blur rounded-xl p-4 border border-white/10 text-white pointer-events-auto shadow-xl hidden md:block">
-            <h3 className="font-bold text-lg mb-1">Room Viewer</h3>
-            <p className="text-xs text-slate-300 mb-0">Detected {planes.length} surfaces</p>
-            
+            <h3 className="font-bold text-lg mb-1">3D Room Model</h3>
+            <p className="text-xs text-slate-300 mb-0">({planes.length} surfaces)</p>
+            <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+              <div className="rounded-lg bg-white/5 px-3 py-2">
+                <div className="text-slate-400">Avg confidence</div>
+                <div className="font-semibold text-emerald-300">{scanStats.averageConfidence.toFixed(0)}%</div>
+              </div>
+              <div className="rounded-lg bg-white/5 px-3 py-2">
+                <div className="text-slate-400">Sensor/depth</div>
+                <div className="font-semibold text-indigo-300">{scanStats.sensorSamples}/{scanStats.depthSamples}</div>
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 mt-2">{scanStats.confidentPlanes} surfaces passed stability filters.</p>
             {viewMode === 'enhanced' && (
               <div className="mt-3 pt-3 border-t border-white/10">
                 <p className="text-xs text-slate-300 mb-1 flex items-center gap-1">
@@ -678,7 +638,7 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
             )}
         </div>
       </div>
-      
+
       {/* Material Toolbar */}
       {viewMode === 'enhanced' && selectedMeshId && (
           <div 
@@ -702,128 +662,110 @@ export function RoomViewer({ planes, lighting, onBack }: { planes: ScannedPlane[
           </div>
       )}
 
-      <div className="flex-1 w-full h-full relative cursor-move">
-        {viewMode === 'layout2d' ? (
-             <div className="absolute inset-0 bg-slate-900 flex items-center justify-center p-8 overflow-hidden touch-pinch-zoom">
-                <svg 
-                  viewBox={maxX !== -Infinity ? `${minX - 1} ${minZ - 1} ${maxX - minX + 2} ${maxZ - minZ + 2}` : "0 0 10 10"} 
-                  className="w-full h-full max-w-4xl"
-                  preserveAspectRatio="xMidYMid meet"
-                >
-                   {/* Floor Profile */}
-                   <polygon 
-                       points={floorHullPoints.map(p => `${p.x},${p.z}`).join(' ')} 
-                       fill="#1e293b" 
-                       stroke="#475569" 
-                       strokeWidth="0.05" 
-                   />
+      <div className="flex-1 w-full h-full relative cursor-move" onPointerDown={() => {
+          // Deselect if clicking the background in enhanced mode
+          if (viewMode === 'enhanced' && selectedMeshId) {
+             // setSelectedMeshId(null);
+          }
+      }}>
+        <Canvas dpr={[1.5, 2.5]} gl={{ antialias: true, powerPreference: 'high-performance' }} camera={{ position: [roomCenter[0], (ceilingY - floorY) * 1.5 || 3, roomCenter[2] + 4], fov: 100 }}>
+          <color attach="background" args={['#0f172a']} />
+          <ambientLight intensity={0.5} />
+          <directionalLight position={[10, 15, 10]} intensity={1.5} color="#ffffff" castShadow />
+          <directionalLight position={[-10, 5, -10]} intensity={0.5} color="#a3b8cc" />
 
-                   {/* Walls */}
-                   {enhancedWalls.map(w => {
-                       const angleDeg = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...w.quaternion)).y * 180 / Math.PI;
-                       const isUpsideDown = angleDeg > 90 || angleDeg < -90;
-                       
-                       return (
-                          <g key={w.id} transform={`translate(${w.position[0]}, ${w.position[2]}) rotate(${-angleDeg})`}>
-                              {/* Wall line */}
-                              <line x1={-w.width/2} y1={0} x2={w.width/2} y2={0} stroke="#94a3b8" strokeWidth="0.15" strokeLinecap="round" />
-                              
-                              {/* Wall length label */}
-                              <g transform={isUpsideDown ? `rotate(180) translate(0, -0.2)` : `translate(0, -0.2)`}>
-                                  <text x="0" y="0" fontSize="0.14" fill="#cbd5e1" textAnchor="middle" fontWeight="500">
-                                      {w.width.toFixed(2)}m
-                                  </text>
-                              </g>
-                          </g>
-                       )
-                   })}
+          <group>
+            {viewMode === 'raw' && rawPlaneMeshes.map((pm, idx) => (
+              <mesh key={pm.id} geometry={pm.geometry} position={pm.position} quaternion={pm.quaternion} renderOrder={idx}>
+                <meshPhysicalMaterial color={pm.color} side={THREE.DoubleSide} transparent opacity={0.8} roughness={0.2} metalness={0.1} />
+                <lineSegments>
+                  <edgesGeometry args={[pm.geometry]} />
+                  <lineBasicMaterial color="white" linewidth={3} opacity={0.6} transparent />
+                </lineSegments>
+              </mesh>
+            ))}
 
-                   {/* Features */}
-                   {features.map(f => {
-                       const angleDeg = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...f.quaternion)).y * 180 / Math.PI;
-                       const isUpsideDown = angleDeg > 90 || angleDeg < -90;
-                       const color = f.type === 'door' ? '#a78bfa' : '#38bdf8';
-                       const label = f.type === 'door' ? 'Door' : 'Window';
+            {viewMode === 'enhanced' && (() => {
+                const floorMatProps = customMaterials['floor'] ? MATERIAL_PRESETS[customMaterials['floor']] : MATERIAL_PRESETS.defaultFloor;
+                const isFloorSelected = selectedMeshId === 'floor';
 
-                       return (
-                          <g key={f.id} transform={`translate(${f.position[0]}, ${f.position[2]}) rotate(${-angleDeg})`}>
-                              <g transform={`translate(${f.localCenter[0]}, ${f.localCenter[1]})`}>
-                                 <rect 
-                                    x={-f.width/2} 
-                                    y={-0.08} 
-                                    width={f.width} 
-                                    height={0.16} 
-                                    fill={color} 
-                                    fillOpacity="0.2"
-                                    stroke={color}
-                                    strokeWidth="0.04"
-                                    rx="0.02"
-                                 />
-                                 <g transform={`rotate(${isUpsideDown ? 180 : 0}) translate(0, ${isUpsideDown ? -0.25 : -0.15})`}>
-                                    <text x="0" y="0" fontSize="0.12" textAnchor="middle" fill={color} fontWeight="600">
-                                        {label} ({f.width.toFixed(2)}m)
-                                    </text>
-                                 </g>
-                              </g>
-                          </g>
-                       )
-                   })}
+                return (
+                  <>
+                     {/* Floor */}
+                     <mesh
+                        geometry={floorHull}
+                        position={[0, floorY, 0]}
+                        onClick={(e) => { e.stopPropagation(); setSelectedMeshId('floor'); }}
+                     >
+                        <meshPhysicalMaterial
+                            {...floorMatProps}
+                            side={THREE.DoubleSide}
+                            transparent={false}
+                            opacity={1}
+                            emissive={isFloorSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
+                        />
+                        <lineSegments>
+                          <edgesGeometry args={[floorHull]} />
+                          <lineBasicMaterial color={isFloorSelected ? '#fff' : '#10b981'} linewidth={3} opacity={isFloorSelected ? 1 : 0.6} transparent />
+                        </lineSegments>
+                     </mesh>
 
-                   {/* Objects */}
-                   {objects && objects.map(o => {
-                       const angleDeg = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...o.quaternion)).y * 180 / Math.PI;
-                       const isUpsideDown = angleDeg > 90 || angleDeg < -90;
-                       let color = '#f59e0b';
-                       if (o.type === 'chair') color = '#f43f5e';
-                       if (o.type === 'sofa') color = '#d946ef';
-                       if (o.type === 'wardrobe') color = '#f97316';
-                       if (o.type === 'tv') color = '#14b8a6';
+                     {/* Ceiling */}
+                     <mesh geometry={ceilingHull} position={[0, ceilingY, 0]}>
+                        <meshPhysicalMaterial color={0x10b981} side={THREE.DoubleSide} transparent opacity={0.1} roughness={0.2} metalness={0.1} />
+                     </mesh>
 
-                       return (
-                          <g key={o.id} transform={`translate(${o.position[0]}, ${o.position[2]}) rotate(${-angleDeg})`}>
-                             <rect 
-                                x={-o.width/2} 
-                                y={-o.depth/2} 
-                                width={o.width} 
-                                height={o.depth} 
-                                fill={color} 
-                                fillOpacity="0.2"
-                                stroke={color}
-                                strokeWidth="0.04"
-                                strokeDasharray="0.1,0.05"
-                                rx="0.05"
-                             />
-                             <g transform={`rotate(${isUpsideDown ? 180 : 0}) translate(0, ${isUpsideDown ? -o.depth/2 - 0.15 : -o.depth/2 - 0.05})`}>
-                                <text x="0" y="0" fontSize="0.12" textAnchor="middle" fill={color} fontWeight="600">
-                                    {o.type.charAt(0).toUpperCase() + o.type.slice(1)}
-                                </text>
-                             </g>
-                          </g>
-                       )
-                   })}
-                   
-                   {/* Dimensions Overlay */}
-                   {maxX !== -Infinity && (
-                       <>
-                         <line x1={minX} y1={minZ - 0.5} x2={maxX} y2={minZ - 0.5} stroke="#f59e0b" strokeWidth="0.02" />
-                         <text x={(minX + maxX)/2} y={minZ - 0.6} fontSize="0.2" fill="#f59e0b" textAnchor="middle">W: {(maxX - minX).toFixed(2)}m</text>
-                         
-                         <line x1={minX - 0.5} y1={minZ} x2={minX - 0.5} y2={maxZ} stroke="#10b981" strokeWidth="0.02" />
-                         <g transform={`translate(${minX - 0.6}, ${(minZ + maxZ)/2}) rotate(-90)`}>
-                            <text x={0} y={0} fontSize="0.2" fill="#10b981" textAnchor="middle">L: {(maxZ - minZ).toFixed(2)}m</text>
-                         </g>
-                       </>
-                   )}
-                </svg>
-             </div>
-        ) : (
-             <div ref={containerRef} className="w-full h-full text-slate-100" />
-        )}
+                     {/* Walls */}
+                     {enhancedWalls.map(w => {
+                        const matProps = customMaterials[w.id] ? MATERIAL_PRESETS[customMaterials[w.id]] : MATERIAL_PRESETS.defaultWall;
+                        const isSelected = selectedMeshId === w.id;
+                        const wallGeometry = enhancedWallGeometryMap.get(w.id);
+                        if (!wallGeometry) return null;
+
+                        return (
+                          <group key={w.id} position={w.position} quaternion={w.quaternion}>
+                            <mesh
+                                rotation={[-Math.PI / 2, 0, 0]}
+                                onClick={(e) => { e.stopPropagation(); setSelectedMeshId(w.id); }}
+                                geometry={wallGeometry}
+                            >
+                               <meshPhysicalMaterial
+                                    {...matProps}
+                                    side={THREE.DoubleSide}
+                                    transparent={false}
+                                    opacity={1}
+                                    emissive={isSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
+                               />
+                               <lineSegments>
+                                 <edgesGeometry args={[wallGeometry]} />
+                                 <lineBasicMaterial color={isSelected ? '#fff' : '#3b82f6'} linewidth={3} opacity={isSelected ? 1 : 0.6} transparent />
+                               </lineSegments>
+                            </mesh>
+                          </group>
+                        );
+                     })}
+                  </>
+                );
+            })()}
+          </group>
+
+          <Grid infiniteGrid fadeDistance={30} sectionColor="#475569" cellColor="#1e293b" position={[0, floorY - 0.1, 0]} />
+
+          {/* @ts-ignore */}
+          <OrbitControls
+            target={[roomCenter[0], (ceilingY + floorY) / 2 || 0, roomCenter[2]]}
+            makeDefault
+            autoRotate={false}
+            maxPolarAngle={Math.PI / 2 + 0.2}
+            enableDamping
+            dampingFactor={0.05}
+          />
+          <Environment preset="city" />
+        </Canvas>
       </div>
-      
-      {viewMode !== 'layout2d' && (
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 pointer-events-none text-slate-400 text-xs tracking-wide bg-black/40 px-6 py-2 rounded-full border border-white/5 backdrop-blur z-10">
-        Drag to rotate • Pinch/Scroll to zoom • Click surface to select
+
+      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 pointer-events-none text-slate-400 text-sm tracking-wide bg-black/40 px-6 py-2 rounded-full border border-white/5 backdrop-blur">
+        Drag to rotate • Pinch to zoom
       </div>
       )}
 
