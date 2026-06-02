@@ -2,6 +2,9 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { Activity, Check, Gauge, RotateCcw, Scan, ShieldCheck, X } from 'lucide-react';
 import { Button } from './ui/button';
+import { RoomReconstruction } from '../core/processing/RoomReconstruction';
+import { RoomLighting, RoomModel } from '../core/models/types';
+import { MiniMap } from './MiniMap';
 
 export interface SensorSnapshot {
   timestamp: number;
@@ -324,6 +327,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setSize(window.innerWidth, window.innerHeight, false);
     renderer.xr.enabled = true;
+    // renderer.xr.setFramebufferScaleFactor(window.devicePixelRatio);
     container.appendChild(renderer.domElement);
 
     const onSessionStart = () => {
@@ -349,11 +353,26 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
     const planesMap = new Map<any, THREE.Mesh>();
     let currentSession: XRSessionLike | null = null;
     let planeIdCounter = 0;
+    let planeSupportChecked = false;
+    let lastScanTime = Date.now();
+    let lastPlaneCount = 0;
+    let slowProgressCount = 0;
+    let xrLightProbe: any = null;
+    let lightProbeRequested = false;
+    
+    // Store latest room lighting
+    const currentLighting = {
+        ambientColor: 0xffffff,
+        ambientIntensity: 0.5,
+        primaryLightDirection: [0, -1, 0] as [number, number, number],
+        primaryLightColor: 0xffffff,
+        primaryLightIntensity: 0.0
+    };
 
-    const onWindowResize = () => {
+    onWindowResize = () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
     };
     window.addEventListener('resize', onWindowResize);
 
@@ -374,6 +393,110 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
         const detectedPlanes = getDetectedPlaneSet(frame.detectedPlanes);
         if (detectedPlanes) {
           detectedPlanes.forEach((plane: any) => {
+            const pose = frame.getPose(plane.planeSpace, referenceSpace);
+            if (!pose) return;
+
+            const isHoriz = plane.orientation?.toLowerCase() === 'horizontal';
+            const isVert = plane.orientation?.toLowerCase() === 'vertical';
+
+            const normal = new THREE.Vector3(0, 1, 0).applyQuaternion(pose.transform.orientation);
+            let isValidAngle = true;
+            if (isHoriz && Math.abs(normal.y) < 0.85) isValidAngle = false;
+            if (isVert && Math.abs(normal.y) > 0.15) isValidAngle = false;
+
+            let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+            let worldMinY = Infinity, worldMaxY = -Infinity;
+            for (let i = 0; i < plane.polygon.length; i++) {
+              const p = plane.polygon[i];
+              minX = Math.min(minX, p.x);
+              maxX = Math.max(maxX, p.x);
+              minZ = Math.min(minZ, p.z);
+              maxZ = Math.max(maxZ, p.z);
+
+              const wp = new THREE.Vector3(p.x, p.y, p.z)
+                            .applyQuaternion(pose.transform.orientation)
+                            .add(new THREE.Vector3(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z));
+              worldMinY = Math.min(worldMinY, wp.y);
+              worldMaxY = Math.max(worldMaxY, wp.y);
+            }
+            const areaApprox = (maxX - minX) * (maxZ - minZ);
+            
+            // Improved detection heuristics based on physical dimensions
+            const heightApprox = worldMaxY - worldMinY;
+            const widthApprox = areaApprox / Math.max(0.001, heightApprox);
+
+            let semanticClass = plane.semanticLabel?.toLowerCase();
+            
+            // If missing or just "wall", analyze shape to refine detection
+            if (!semanticClass || semanticClass === 'unknown' || semanticClass === 'wall') {
+              if (isHoriz) {
+                if (pose.transform.position.y < 0.3) semanticClass = 'floor';
+                else if (pose.transform.position.y > 1.8) semanticClass = 'ceiling';
+                else if (pose.transform.position.y < 0.65 && areaApprox < 0.6) semanticClass = 'chair';
+                else if (pose.transform.position.y < 0.65 && areaApprox >= 0.6) semanticClass = 'sofa';
+                else if (areaApprox < 3.0) semanticClass = 'table';
+                else semanticClass = 'unknown';
+              } else if (isVert) {
+                // Door: reaches floor, typ. 1.9-2.2m tall, 0.7-1.2m wide
+                if (worldMinY < 0.4 && heightApprox > 1.8 && widthApprox >= 0.6 && widthApprox <= 1.4) {
+                   semanticClass = 'door';
+                } 
+                // Window: floating off floor, reasonable size
+                else if (worldMinY >= 0.5 && heightApprox >= 0.4 && widthApprox >= 0.4 && widthApprox <= 3.0) {
+                   semanticClass = 'window';
+                }
+                // Wardrobe / Tall Cabinet: thick, not too wide, sitting on floor
+                else if (worldMinY < 0.3 && widthApprox >= 0.4 && widthApprox <= 2.5 && heightApprox >= 1.0 && heightApprox <= 2.8) {
+                   semanticClass = 'wardrobe';
+                }
+                // TV / Monitor: floating, very thin
+                else if (worldMinY >= 0.5 && widthApprox >= 0.6 && widthApprox <= 2.0 && heightApprox >= 0.4 && heightApprox <= 1.5) {
+                   semanticClass = 'tv';
+                }
+                // Door frame / Pillar / Edge: tall but narrow
+                else if (widthApprox < 0.4 && heightApprox > 1.2) {
+                   semanticClass = 'door_frame';
+                }
+                else {
+                   semanticClass = 'wall';
+                }
+              } else {
+                 semanticClass = 'unknown';
+              }
+            }
+
+            let requiredArea = 0.1;
+            // Lowered thresholds to detect smaller features like door frames and complex room geometries
+            if (semanticClass === 'door_frame') {
+               requiredArea = 0.01;
+            } else if (['table', 'chair', 'sofa', 'door', 'window'].includes(semanticClass)) {
+               requiredArea = 0.02; // Very small for frames and furniture
+            } else if (semanticClass === 'floor' || semanticClass === 'ceiling') {
+               requiredArea = 0.1; 
+            } else if (semanticClass === 'wall') {
+               requiredArea = 0.05; // Lowered to catch short partition walls and corners
+            }
+
+            if (!isValidAngle || areaApprox < requiredArea) {
+               let mesh = planesMap.get(plane);
+               if (mesh) mesh.visible = false;
+               planesDataRef.current.delete(plane);
+               return;
+            }
+
+            let color = 0x9ca3af; 
+            if (semanticClass === 'floor') color = 0x10b981; 
+            else if (semanticClass === 'ceiling') color = 0x06b6d4; 
+            else if (semanticClass === 'wall') color = 0x3b82f6; 
+            else if (semanticClass === 'door_frame') color = 0xec4899; 
+            else if (semanticClass === 'table') color = 0xf59e0b; 
+            else if (semanticClass === 'chair') color = 0xf43f5e; 
+            else if (semanticClass === 'sofa') color = 0xd946ef; 
+            else if (semanticClass === 'door') color = 0x8b5cf6; 
+            else if (semanticClass === 'window') color = 0x38bdf8; 
+            else if (semanticClass === 'wardrobe') color = 0xf97316; // Orange
+            else if (semanticClass === 'tv') color = 0x14b8a6; // Teal 
+
             let mesh = planesMap.get(plane);
             if (!mesh) {
               const orientation = typeof plane.orientation === 'string' ? plane.orientation : 'unknown';
@@ -382,10 +505,12 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
               const material = new THREE.MeshBasicMaterial({
                 color: color,
                 transparent: true,
-                opacity: 0.6,
-                side: THREE.DoubleSide
+                opacity: 0.8,
+                linewidth: 2
               });
-              mesh = new THREE.Mesh(new THREE.BufferGeometry(), material);
+              const geom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0)]);
+              mesh = new THREE.LineLoop(geom, material) as unknown as THREE.Mesh;
+              
               scene.add(mesh);
               planesMap.set(plane, mesh);
 
@@ -485,6 +610,128 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
           updateScanQuality(stablePlanes, planesMap.size, timestamp);
         }
       }
+
+      frameCount++;
+      if (frameCount % 30 === 0 && planesDataRef.current.size >= 2) {
+          try {
+              const planesArray = Array.from(planesDataRef.current.values());
+              const roomModel = RoomReconstruction.buildRoomModel(planesArray);
+              setLiveRoomModel(roomModel);
+              
+              // Clear previous wireframes safely
+              const disposeNode = (node: any) => {
+                  if (node.geometry) node.geometry.dispose();
+                  if (node.material) {
+                      if (Array.isArray(node.material)) {
+                          node.material.forEach((m: any) => m.dispose());
+                      } else {
+                          node.material.dispose();
+                      }
+                  }
+                  if (node.children) {
+                      node.children.forEach(disposeNode);
+                  }
+              };
+              wireframeGroup.children.forEach(disposeNode);
+              wireframeGroup.clear();
+
+              // Build wireframe for walls
+              roomModel.enhancedWalls.forEach(w => {
+                  const geometry = new THREE.PlaneGeometry(w.width, w.height);
+                  const edges = new THREE.EdgesGeometry(geometry);
+                  const material = new THREE.LineBasicMaterial({ color: 0x3b82f6, linewidth: 2 });
+                  const line = new THREE.LineSegments(edges, material);
+                  line.position.set(w.position[0], w.position[1], w.position[2]);
+                  line.quaternion.set(w.quaternion[0], w.quaternion[1], w.quaternion[2], w.quaternion[3]);
+                  wireframeGroup.add(line);
+              });
+
+              // Build wireframe for floor
+              if (roomModel.floorHullPoints.length > 2) {
+                  const floorPoints: THREE.Vector3[] = [];
+                  roomModel.floorHullPoints.forEach(p => {
+                      floorPoints.push(new THREE.Vector3(p.x, 0, -p.z));
+                  });
+                  const floorGeom = new THREE.BufferGeometry().setFromPoints(floorPoints);
+                  const floorMat = new THREE.LineBasicMaterial({ color: 0x10b981, linewidth: 2 });
+                  
+                  const floorLine = new THREE.LineLoop(floorGeom, floorMat);
+                  floorLine.position.y = roomModel.floorY;
+                  wireframeGroup.add(floorLine);
+                  
+                  const ceilLine = new THREE.LineLoop(floorGeom, floorMat);
+                  ceilLine.position.y = roomModel.ceilingY;
+                  wireframeGroup.add(ceilLine);
+              }
+
+              // Build wireframe for features
+              roomModel.features.forEach(f => {
+                  const geometry = new THREE.PlaneGeometry(f.width, f.height);
+                  const edges = new THREE.EdgesGeometry(geometry);
+                  const material = new THREE.LineBasicMaterial({ color: f.type === 'door' ? 0x8b5cf6 : 0x38bdf8, linewidth: 2 });
+                  const line = new THREE.LineSegments(edges, material);
+                  line.position.set(f.localCenter[0], 0, f.localCenter[1]);
+                  line.rotation.set(-Math.PI / 2, 0, 0);
+
+                  // Features need to be wrapped in a group to apply the parent position/quaternion like in RoomViewer
+                  const group = new THREE.Group();
+                  group.position.set(f.position[0], f.position[1], f.position[2]);
+                  group.quaternion.set(f.quaternion[0], f.quaternion[1], f.quaternion[2], f.quaternion[3]);
+                  group.add(line);
+                  wireframeGroup.add(group);
+              });
+              
+          } catch(err) {
+              console.error("Wireframe update error", err);
+          }
+      }
+
+      // Update guidance animations
+      if (frameCount >= 0) {
+        const totalPlanes = planesDataRef.current.size;
+        
+        // Show floor circle if no floor found or early in scan
+        if (totalPlanes === 0) {
+            floorCircle.visible = true;
+            // Place circle on the floor in front of the camera
+            const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+            dir.y = 0;
+            if (dir.lengthSq() < 0.01) { dir.set(0, 0, -1); }
+            dir.normalize();
+            const pos = camera.position.clone().add(dir.multiplyScalar(1.5));
+            pos.y = -camera.position.y * 0.8; // Approximate floor if device is held at chest height
+            floorCircle.position.copy(pos);
+            const scale = 1.0 + Math.sin(timestamp / 150) * 0.2;
+            floorCircle.scale.set(scale, scale, scale);
+            movingArrow.visible = false;
+        } else {
+            floorCircle.visible = false;
+            
+            if (slowProgressCount > 0 && totalPlanes < 10) {
+                movingArrow.visible = true;
+                const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+                dir.y = 0;
+                if (dir.lengthSq() < 0.01) { dir.set(0, 0, -1); }
+                dir.normalize();
+                
+                // Animate arrow swiping left and right
+                const swipe = Math.sin(timestamp / 500) * 0.5;
+                const right = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0, 1, 0)).normalize();
+                
+                const pos = camera.position.clone()
+                    .add(dir.multiplyScalar(1.0))
+                    .add(right.multiplyScalar(swipe));
+                
+                movingArrow.position.copy(pos);
+                // Rotate arrow to point in the direction of swipe
+                const pointDir = Math.cos(timestamp / 500) > 0 ? right : right.clone().negate();
+                movingArrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), pointDir);
+            } else {
+                movingArrow.visible = false;
+            }
+        }
+      }
+
       renderer.render(scene, camera);
     };
 
@@ -717,10 +964,15 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
            </div>
 
            {activePlanesCount > 0 && (
-             <Button onClick={handleFinish} className="bg-indigo-600 hover:bg-indigo-500 text-white pointer-events-auto rounded-full px-6 shadow-[0_0_20px_-5px_rgba(79,70,229,1)] flex items-center gap-2">
-                 <Check className="w-5 h-5" />
-                 Finish Mapping
-             </Button>
+             <div className="flex flex-col gap-4 items-end pointer-events-auto">
+               <Button onClick={handleFinish} className="bg-indigo-600 hover:bg-indigo-500 text-white rounded-full px-6 shadow-[0_0_20px_-5px_rgba(79,70,229,1)] flex items-center gap-2">
+                   <Check className="w-5 h-5" />
+                   Finish Mapping
+               </Button>
+               {liveRoomModel && (
+                 <MiniMap roomModel={liveRoomModel} className="w-32 h-32 md:w-48 md:h-48 border border-white/20 shadow-2xl" />
+               )}
+             </div>
            )}
         </div>
         <div className="text-center pb-8 pointer-events-none">

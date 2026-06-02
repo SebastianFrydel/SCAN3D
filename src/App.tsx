@@ -1,17 +1,55 @@
 import React, { useState, useEffect } from 'react';
 import { ARScanner, ScannedPlane } from './components/ARScanner';
+import { ScannerSimulator } from './components/ScannerSimulator';
 import { RoomViewer } from './components/RoomViewer';
 import { Button } from './components/ui/button';
 import { AlertCircle, Camera, Cpu, Ruler, Scan, Smartphone } from 'lucide-react';
 import { Toaster } from 'sonner';
+import { RoomLighting } from './core/models/types';
 
-type AppState = 'landing' | 'scanning' | 'viewing';
+type AppState = 'landing' | 'scanning' | 'simulating' | 'viewing';
 
-export default function App() {
+class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: any, errorInfo: any}> {
+  constructor(props: {children: React.ReactNode}) {
+    super(props);
+    this.state = { error: null, errorInfo: null };
+  }
+  componentDidCatch(error: any, errorInfo: any) {
+    this.setState({ error, errorInfo });
+    console.error(error, errorInfo);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 20, whiteSpace: 'pre-wrap', color: 'red' }}>
+          <h2>Something went wrong.</h2>
+          <details>
+            <summary>Error Details</summary>
+            {this.state.error && this.state.error.toString()}
+            <br />
+            {this.state.errorInfo && this.state.errorInfo.componentStack}
+          </details>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function AppWrapper() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+function App() {
   const [state, setState] = useState<AppState>('landing');
   const [isWebXRSupported, setIsWebXRSupported] = useState(false);
   const [supportChecked, setSupportChecked] = useState(false);
   const [scannedPlanes, setScannedPlanes] = useState<ScannedPlane[]>([]);
+  const [roomLighting, setRoomLighting] = useState<RoomLighting | undefined>(undefined);
 
   useEffect(() => {
     if ('xr' in navigator) {
@@ -27,8 +65,14 @@ export default function App() {
     }
   }, []);
 
-  const handleScanComplete = (planes: ScannedPlane[]) => {
-    setScannedPlanes(planes);
+  const handleScanComplete = (planes: ScannedPlane[], scaleFactor: number = 1.0, lighting?: RoomLighting) => {
+    setScannedPlanes(planes.map(p => {
+        // Multiply by scale factor
+        const scaledPoly = p.polygon.map(pt => ({x: pt.x * scaleFactor, y: pt.y * scaleFactor, z: pt.z * scaleFactor}));
+        const scaledPos = {x: p.position.x * scaleFactor, y: p.position.y * scaleFactor, z: p.position.z * scaleFactor};
+        return {...p, polygon: scaledPoly, position: scaledPos};
+    }));
+    setRoomLighting(lighting);
     setState('viewing');
   };
 
@@ -36,8 +80,12 @@ export default function App() {
     return <ARScanner onComplete={handleScanComplete} onCancel={() => setState('landing')} />;
   }
 
+  if (state === 'simulating') {
+    return <ScannerSimulator onComplete={handleScanComplete} onCancel={() => setState('landing')} />;
+  }
+
   if (state === 'viewing') {
-    return <RoomViewer planes={scannedPlanes} onBack={() => setState('landing')} />;
+    return <RoomViewer planes={scannedPlanes} lighting={roomLighting} onBack={() => setState('landing')} />;
   }
 
   return (
