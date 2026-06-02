@@ -52,6 +52,20 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
   const [selectedMeshId, setSelectedMeshId] = useState<string | null>(null);
   const [customMaterials, setCustomMaterials] = useState<Record<string, MaterialType>>({});
 
+  const scanStats = useMemo(() => {
+    const confidentPlanes = planes.filter((plane) => (plane.confidence ?? 0) >= 45);
+    const averageConfidence = planes.length
+      ? planes.reduce((sum, plane) => sum + (plane.confidence ?? 0), 0) / planes.length
+      : 0;
+    const sensorSamples = planes.filter((plane) => plane.sensor).length;
+
+    return {
+      confidentPlanes: confidentPlanes.length,
+      averageConfidence,
+      sensorSamples
+    };
+  }, [planes]);
+
   // Process data for the enhanced view
   const { enhancedWalls, floorHull, ceilingHull, floorY, ceilingY, roomCenter } = useMemo(() => {
     let globalMinY = Infinity;
@@ -66,7 +80,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
         const globalPoints = plane.polygon.map(p => {
             return new THREE.Vector3(p.x, p.y, p.z).applyMatrix4(matrix);
         });
-        
+
         let minY = Infinity, maxY = -Infinity;
         globalPoints.forEach(p => {
             minY = Math.min(minY, p.y);
@@ -118,7 +132,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
 
     const hull = getConvexHull(allXZPoints);
     let rCX = 0, rCZ = 0;
-    
+
     // Create shapes for hull
     let floorShape = new THREE.Shape();
     let ceilShape = new THREE.Shape();
@@ -140,7 +154,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
        floorShape.moveTo(-1, -1); floorShape.lineTo(1, -1); floorShape.lineTo(1, 1); floorShape.lineTo(-1, 1);
        ceilShape.moveTo(-1, -1); ceilShape.lineTo(1, -1); ceilShape.lineTo(1, 1); ceilShape.lineTo(-1, 1);
     }
-    
+
     const fGeom = new THREE.ShapeGeometry(floorShape);
     fGeom.rotateX(-Math.PI / 2); // local flat to XZ
     const cGeom = new THREE.ShapeGeometry(ceilShape);
@@ -151,19 +165,19 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
         for (let i = 0; i < hull.length; i++) {
             const p1 = hull[i];
             const p2 = hull[(i + 1) % hull.length];
-            
+
             const dx = p2.x - p1.x;
             const dz = p2.z - p1.z;
             const width = Math.hypot(dx, dz);
             const height = cY - fY;
-            
+
             const midX = (p1.x + p2.x) / 2;
             const midZ = (p1.z + p2.z) / 2;
             const cy = (cY + fY) / 2;
-            
+
             const theta = -Math.atan2(dz, dx);
             const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), theta);
-            
+
             enhancedWallsData.push({
                 id: 'hull_wall_' + i,
                 width,
@@ -175,11 +189,11 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
         }
     }
 
-    return { 
-        enhancedWalls: enhancedWallsData, 
-        floorHull: fGeom, 
-        ceilingHull: cGeom, 
-        floorY: fY, 
+    return {
+        enhancedWalls: enhancedWallsData,
+        floorHull: fGeom,
+        ceilingHull: cGeom,
+        floorY: fY,
         ceilingY: cY,
         roomCenter: [rCX, 0, rCZ] as [number, number, number]
     };
@@ -195,7 +209,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
       }
       const geom = new THREE.ShapeGeometry(shape);
       geom.rotateX(-Math.PI / 2);
-      
+
       return {
         id: plane.id,
         geometry: geom,
@@ -206,14 +220,26 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
     });
   }, [planes]);
 
+  const enhancedWallGeometries = useMemo(() => {
+    return enhancedWalls.map(w => ({
+      id: w.id,
+      geometry: new THREE.PlaneGeometry(w.width, w.height)
+    }));
+  }, [enhancedWalls]);
+  const enhancedWallGeometryMap = useMemo(() => {
+    return new Map(enhancedWallGeometries.map((wg) => [wg.id, wg.geometry]));
+  }, [enhancedWallGeometries]);
 
   useEffect(() => {
     return () => {
       floorHull.dispose();
       ceilingHull.dispose();
       rawPlaneMeshes.forEach((pm) => pm.geometry.dispose());
+      enhancedWallGeometries.forEach((wg) => {
+        wg.geometry.dispose();
+      });
     };
-  }, [floorHull, ceilingHull, rawPlaneMeshes]);
+  }, [floorHull, ceilingHull, rawPlaneMeshes, enhancedWallGeometries]);
 
   const handleApplyMaterial = (matType: MaterialType) => {
       if (selectedMeshId) {
@@ -231,19 +257,19 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
           <ArrowLeft className="w-5 h-5 mr-2" />
           Rescan Room
         </Button>
-        
+
         <div className="flex flex-wrap md:flex-nowrap gap-2 pointer-events-auto w-full md:w-auto">
            <div className="flex gap-2 shrink-0">
-               <Button 
-                  variant={viewMode === 'raw' ? 'default' : 'outline'} 
+               <Button
+                  variant={viewMode === 'raw' ? 'default' : 'outline'}
                   className={`shadow-lg transition-all ${viewMode === 'raw' ? 'bg-indigo-600 hover:bg-indigo-500 border-0' : 'bg-black/50 border-white/10 text-white hover:bg-black/70'}`}
                   onClick={() => { setViewMode('raw'); setSelectedMeshId(null); }}
                >
                   <Layers className="w-4 h-4 mr-2 hidden sm:block" />
                   Raw
                </Button>
-               <Button 
-                  variant={viewMode === 'enhanced' ? 'default' : 'outline'} 
+               <Button
+                  variant={viewMode === 'enhanced' ? 'default' : 'outline'}
                   className={`shadow-lg transition-all ${viewMode === 'enhanced' ? 'bg-indigo-600 hover:bg-indigo-500 border-0' : 'bg-black/50 border-white/10 text-white hover:bg-black/70'}`}
                   onClick={() => setViewMode('enhanced')}
                >
@@ -256,6 +282,17 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
         <div className="bg-black/50 backdrop-blur rounded-xl p-4 border border-white/10 text-white pointer-events-auto shadow-xl hidden md:block">
             <h3 className="font-bold text-lg mb-1">3D Room Model</h3>
             <p className="text-xs text-slate-300 mb-0">({planes.length} surfaces)</p>
+            <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+              <div className="rounded-lg bg-white/5 px-3 py-2">
+                <div className="text-slate-400">Avg confidence</div>
+                <div className="font-semibold text-emerald-300">{scanStats.averageConfidence.toFixed(0)}%</div>
+              </div>
+              <div className="rounded-lg bg-white/5 px-3 py-2">
+                <div className="text-slate-400">Sensor fused</div>
+                <div className="font-semibold text-indigo-300">{scanStats.sensorSamples}/{planes.length}</div>
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 mt-2">{scanStats.confidentPlanes} surfaces passed stability filters.</p>
             {viewMode === 'enhanced' && (
               <div className="mt-3 pt-3 border-t border-white/10">
                 <p className="text-xs text-slate-300 mb-1 flex items-center gap-1">
@@ -266,7 +303,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
             )}
         </div>
       </div>
-      
+
       {/* Material Toolbar */}
       {viewMode === 'enhanced' && selectedMeshId && (
           <div className="absolute bottom-6 inset-x-0 mx-auto flex justify-center z-10 pointer-events-none px-4">
@@ -298,7 +335,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
           <ambientLight intensity={0.5} />
           <directionalLight position={[10, 15, 10]} intensity={1.5} color="#ffffff" castShadow />
           <directionalLight position={[-10, 5, -10]} intensity={0.5} color="#a3b8cc" />
-          
+
           <group>
             {viewMode === 'raw' && rawPlaneMeshes.map((pm, idx) => (
               <mesh key={pm.id} geometry={pm.geometry} position={pm.position} quaternion={pm.quaternion} renderOrder={idx}>
@@ -317,16 +354,16 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
                 return (
                   <>
                      {/* Floor */}
-                     <mesh 
-                        geometry={floorHull} 
+                     <mesh
+                        geometry={floorHull}
                         position={[0, floorY, 0]}
                         onClick={(e) => { e.stopPropagation(); setSelectedMeshId('floor'); }}
                      >
-                        <meshPhysicalMaterial 
-                            {...floorMatProps} 
-                            side={THREE.DoubleSide} 
-                            transparent={false} 
-                            opacity={1} 
+                        <meshPhysicalMaterial
+                            {...floorMatProps}
+                            side={THREE.DoubleSide}
+                            transparent={false}
+                            opacity={1}
                             emissive={isFloorSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
                         />
                         <lineSegments>
@@ -344,23 +381,25 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
                      {enhancedWalls.map(w => {
                         const matProps = customMaterials[w.id] ? MATERIAL_PRESETS[customMaterials[w.id]] : MATERIAL_PRESETS.defaultWall;
                         const isSelected = selectedMeshId === w.id;
+                        const wallGeometry = enhancedWallGeometryMap.get(w.id);
+                        if (!wallGeometry) return null;
 
                         return (
                           <group key={w.id} position={w.position} quaternion={w.quaternion}>
-                            <mesh 
+                            <mesh
                                 rotation={[-Math.PI / 2, 0, 0]}
                                 onClick={(e) => { e.stopPropagation(); setSelectedMeshId(w.id); }}
+                                geometry={wallGeometry}
                             >
-                               <planeGeometry args={[w.width, w.height]} />
-                               <meshPhysicalMaterial 
-                                    {...matProps} 
-                                    side={THREE.DoubleSide} 
-                                    transparent={false} 
-                                    opacity={1} 
+                               <meshPhysicalMaterial
+                                    {...matProps}
+                                    side={THREE.DoubleSide}
+                                    transparent={false}
+                                    opacity={1}
                                     emissive={isSelected ? new THREE.Color(0x333333) : new THREE.Color(0x000000)}
                                />
                                <lineSegments>
-                                 <edgesGeometry args={[new THREE.PlaneGeometry(w.width, w.height)]} />
+                                 <edgesGeometry args={[wallGeometry]} />
                                  <lineBasicMaterial color={isSelected ? '#fff' : '#3b82f6'} linewidth={3} opacity={isSelected ? 1 : 0.6} transparent />
                                </lineSegments>
                             </mesh>
@@ -373,12 +412,12 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
           </group>
 
           <Grid infiniteGrid fadeDistance={30} sectionColor="#475569" cellColor="#1e293b" position={[0, floorY - 0.1, 0]} />
-          
+
           {/* @ts-ignore */}
-          <OrbitControls 
+          <OrbitControls
             target={[roomCenter[0], (ceilingY + floorY) / 2 || 0, roomCenter[2]]}
-            makeDefault 
-            autoRotate={false} 
+            makeDefault
+            autoRotate={false}
             maxPolarAngle={Math.PI / 2 + 0.2}
             enableDamping
             dampingFactor={0.05}
@@ -386,7 +425,7 @@ export function RoomViewer({ planes, onBack }: { planes: ScannedPlane[], onBack:
           <Environment preset="city" />
         </Canvas>
       </div>
-      
+
       <div className="absolute bottom-8 left-1/2 -translate-x-1/2 pointer-events-none text-slate-400 text-sm tracking-wide bg-black/40 px-6 py-2 rounded-full border border-white/5 backdrop-blur">
         Drag to rotate • Pinch to zoom
       </div>
