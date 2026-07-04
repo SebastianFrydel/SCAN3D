@@ -479,7 +479,8 @@ export class RoomReconstruction {
                      width: width,
                      depth: depth,
                      height: height,
-                     quaternion: [p.quaternion.x, p.quaternion.y, p.quaternion.z, p.quaternion.w]
+                     quaternion: [p.quaternion.x, p.quaternion.y, p.quaternion.z, p.quaternion.w],
+                     label: label.charAt(0).toUpperCase() + label.slice(1) + ` #${index}`
                  });
              }
         });

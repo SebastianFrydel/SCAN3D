@@ -79,6 +79,24 @@ export function ScannerSimulator({ onComplete, onCancel }: { onComplete: (planes
             position: { x: 0, y: 0, z: 2 },
             quaternion: { x: 0, y: 1, z: 0, w: 0 }, // Back wall
             polygon: [ {x: -2, y: 0, z: -1.5}, {x: 2, y: 0, z: -1.5}, {x: 2, y: 0, z: 1.5}, {x: -2, y: 0, z: 1.5} ]
+        },
+        {
+            id: 6, orientation: 'horizontal', semanticLabel: 'chair', color: 0xeb5757, lastSeen: Date.now(),
+            position: { x: -1.0, y: -1.1, z: -0.5 },
+            quaternion: { x: 0, y: 0, z: 0, w: 1 },
+            polygon: [ {x: -0.25, y: 0, z: -0.25}, {x: 0.25, y: 0, z: -0.25}, {x: 0.25, y: 0, z: 0.25}, {x: -0.25, y: 0, z: 0.25} ]
+        },
+        {
+            id: 7, orientation: 'horizontal', semanticLabel: 'table', color: 0xf2c94c, lastSeen: Date.now(),
+            position: { x: 0, y: -0.8, z: 0.2 },
+            quaternion: { x: 0, y: 0, z: 0, w: 1 },
+            polygon: [ {x: -0.5, y: 0, z: -0.5}, {x: 0.5, y: 0, z: -0.5}, {x: 0.5, y: 0, z: 0.5}, {x: -0.5, y: 0, z: 0.5} ]
+        },
+        {
+            id: 8, orientation: 'horizontal', semanticLabel: 'sofa', color: 0xbb6bd9, lastSeen: Date.now(),
+            position: { x: 1.0, y: -1.0, z: -1.0 },
+            quaternion: { x: 0, y: 0.7071, z: 0, w: 0.7071 },
+            polygon: [ {x: -0.4, y: 0, z: -0.8}, {x: 0.4, y: 0, z: -0.8}, {x: 0.4, y: 0, z: 0.8}, {x: -0.4, y: 0, z: 0.8} ]
         }
     ];
 
@@ -102,7 +120,11 @@ export function ScannerSimulator({ onComplete, onCancel }: { onComplete: (planes
           const plane = mockPlanes[planeIndex];
           planesDataRef.current.set(plane.id, plane);
           
-          let color = plane.orientation === 'horizontal' ? 0xff3333 : 0x3366ff;
+          let color = 
+            plane.semanticLabel === 'chair' ? 0xeb5757 :
+            plane.semanticLabel === 'table' ? 0xf2c94c :
+            plane.semanticLabel === 'sofa' ? 0xbb6bd9 :
+            plane.orientation === 'horizontal' ? 0xff3333 : 0x3366ff;
           
           const material = new THREE.MeshBasicMaterial({
             color: color,

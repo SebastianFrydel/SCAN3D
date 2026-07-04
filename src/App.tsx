@@ -2,8 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { ARScanner, ScannedPlane } from './components/ARScanner';
 import { ScannerSimulator } from './components/ScannerSimulator';
 import { RoomViewer } from './components/RoomViewer';
+import { SensorDiagnostics } from './components/SensorDiagnostics';
 import { Button } from './components/ui/button';
-import { Box, Scan, AlertCircle, Wand2 } from 'lucide-react';
+import { Box, Scan, AlertCircle, Wand2, Cpu } from 'lucide-react';
 import { Toaster } from 'sonner';
 import { RoomLighting } from './core/models/types';
 
@@ -49,6 +50,7 @@ function App() {
   const [isWebXRSupported, setIsWebXRSupported] = useState(false);
   const [scannedPlanes, setScannedPlanes] = useState<ScannedPlane[]>([]);
   const [roomLighting, setRoomLighting] = useState<RoomLighting | undefined>(undefined);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
 
   useEffect(() => {
     if ('xr' in navigator) {
@@ -82,9 +84,17 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-50 font-sans p-6 flex flex-col items-center justify-center">
+    <div className="min-h-screen bg-slate-900 text-slate-50 font-sans p-6 flex flex-col items-center justify-center relative">
       <Toaster position="top-center" />
-      <div className="max-w-md w-full space-y-8 text-center">
+      
+      {/* Diagnostics Modal Dialog Overlay */}
+      {showDiagnostics && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <SensorDiagnostics onClose={() => setShowDiagnostics(false)} />
+        </div>
+      )}
+
+      <div className="max-w-md w-full space-y-8 text-center z-10">
         <div className="mx-auto w-24 h-24 bg-indigo-500/20 rounded-3xl flex items-center justify-center mb-6 text-indigo-400">
           <Scan className="w-12 h-12" />
         </div>
@@ -100,18 +110,33 @@ function App() {
            <div className="bg-red-500/10 border border-red-500/20 p-4 rounded-xl flex flex-col gap-3 text-left">
               <div className="flex gap-3">
                   <AlertCircle className="w-6 h-6 text-red-400 shrink-0" />
-                  <p className="text-sm text-red-200">
-                     Your browser or device does not appear to support WebXR AR or plane detection. 
-                  </p>
+                  <div className="space-y-1">
+                      <p className="text-sm font-semibold text-red-200">
+                         AR capabilities could not be initialized or are blocked.
+                      </p>
+                      <p className="text-xs text-red-300">
+                         This browser lacks direct WebXR access. If using the preview console, open the app in a standalone tab.
+                      </p>
+                  </div>
               </div>
-              <Button 
-                variant="outline"
-                className="w-full mt-2 border-red-500/30 text-red-100 hover:bg-red-500/20"
-                onClick={() => setState('simulating')}
-              >
-                 <Wand2 className="w-4 h-4 mr-2" />
-                 Run Simulated Demo Instead
-              </Button>
+              <div className="flex flex-col gap-2 mt-2">
+                <Button 
+                  variant="outline"
+                  className="w-full border-red-500/30 text-red-100 hover:bg-red-500/20"
+                  onClick={() => setState('simulating')}
+                >
+                   <Wand2 className="w-4 h-4 mr-2" />
+                   Run Simulated Demo
+                </Button>
+                <Button 
+                  variant="ghost"
+                  className="w-full text-xs text-slate-300 hover:text-white"
+                  onClick={() => setShowDiagnostics(true)}
+                >
+                  <Cpu className="w-3.5 h-3.5 mr-1.5" />
+                  Diagnose Sensors & Permissions
+                </Button>
+              </div>
            </div>
         ) : (
           <div className="space-y-4 pt-6">
@@ -121,14 +146,24 @@ function App() {
             >
               Start Room Scan
             </Button>
-            <Button 
-              variant="ghost"
-              className="w-full text-indigo-300 hover:text-indigo-200 hover:bg-indigo-500/10" 
-              onClick={() => setState('simulating')}
-            >
-              <Wand2 className="w-4 h-4 mr-2" />
-              Run Simulated Demo Scan
-            </Button>
+            <div className="flex flex-col gap-2 pt-2">
+              <Button 
+                variant="ghost"
+                className="w-full text-indigo-300 hover:text-indigo-200 hover:bg-indigo-500/10" 
+                onClick={() => setState('simulating')}
+              >
+                <Wand2 className="w-4 h-4 mr-2" />
+                Run Simulated Demo Scan
+              </Button>
+              <Button 
+                variant="ghost"
+                className="w-full text-xs text-slate-400 hover:text-slate-200" 
+                onClick={() => setShowDiagnostics(true)}
+              >
+                <Cpu className="w-3.5 h-3.5 mr-1.5" />
+                Sensor & Tracking Status Health Check
+              </Button>
+            </div>
           </div>
         )}
       </div>

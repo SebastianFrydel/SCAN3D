@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { Check, Info, X, Map as MapIcon, ArrowDown, ArrowRight, ArrowLeft, RefreshCw, Compass } from 'lucide-react';
+import { Check, Info, X, Map as MapIcon, ArrowDown, ArrowRight, ArrowLeft, RefreshCw, Compass, Cpu } from 'lucide-react';
 import { Button } from './ui/button';
 import { RoomReconstruction } from '../core/processing/RoomReconstruction';
 import { RoomLighting, RoomModel } from '../core/models/types';
 import { MiniMap } from './MiniMap';
+import { SensorDiagnostics } from './SensorDiagnostics';
 
 export interface ScannedPlane {
   id: number;
@@ -29,6 +30,7 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
   const [liveRoomModel, setLiveRoomModel] = useState<RoomModel | null>(null);
   const [guidanceTip, setGuidanceTip] = useState<string>('Point at floor to start');
   const [guidanceIcon, setGuidanceIcon] = useState<React.ReactNode>(<ArrowDown className="w-8 h-8 md:w-12 md:h-12" />);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
 
   const engineApiRef = useRef<any>(null);
 
@@ -824,15 +826,33 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
                </Button>
             )}
             {isSupported === false ? (
-               <p className="bg-red-500/80 inline-flex flex-col items-center gap-2 px-4 py-3 rounded-xl text-white text-sm backdrop-blur font-medium border border-red-400/50 max-w-sm pointer-events-auto">
-                   <span className="flex items-center gap-2">
+               <div className="bg-red-500/80 inline-flex flex-col items-center gap-3 px-5 py-4 rounded-xl text-white text-sm backdrop-blur font-medium border border-red-400/50 max-w-sm pointer-events-auto shadow-2xl">
+                   <span className="flex items-center gap-2 font-bold text-base">
                        <Info className="w-5 h-5 flex-shrink-0" />
-                       WebXR AR session failed to start.
+                       AR Session Failed to Start
                    </span>
-                   <span className="text-red-200 text-xs text-center">
-                       If you are in a preview window, please open the app in a new tab. Otherwise, check your site permissions.
+                   <span className="text-red-100 text-xs text-center leading-relaxed">
+                       There may be missing browser sensor permissions (gyroscope/accelerometer), or your browser is running within a sandboxed Preview window.
                    </span>
-               </p>
+                   <div className="flex gap-2 w-full pt-1.5">
+                     <Button 
+                       variant="secondary"
+                       size="sm"
+                       className="flex-1 text-xs bg-white text-slate-900 border-0 hover:bg-white/95"
+                       onClick={() => setShowDiagnostics(true)}
+                     >
+                       <Cpu className="w-3.5 h-3.5 mr-1.5" /> Diagnose Sensors
+                     </Button>
+                     <Button 
+                       variant="outline"
+                       size="sm"
+                       className="flex-1 text-xs border-white/20 text-white bg-transparent hover:bg-white/10"
+                       onClick={onCancel}
+                     >
+                       Go Back
+                     </Button>
+                   </div>
+               </div>
             ) : isSupported === true ? (
                 <p className={`inline-flex items-center gap-2 px-6 py-4 rounded-full text-white text-sm md:text-base backdrop-blur font-medium border transition-all duration-500 ${scanQuality === 'high' ? 'bg-emerald-500/20 border-emerald-500/30' : 'bg-black/60 border-white/10'}`}>
                     {scanQuality === 'high' ? <Check className="w-5 h-5 text-emerald-400" /> : <Info className="w-5 h-5 text-indigo-400" />}
@@ -842,6 +862,13 @@ export function ARScanner({ onComplete, onCancel }: { onComplete: (planes: Scann
          </div>
         </div>
       </div>
-    </>
+
+      {/* Sensor Diagnostics Modal */}
+      {showDiagnostics && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/90 backdrop-blur-md pointer-events-auto">
+          <SensorDiagnostics onClose={() => setShowDiagnostics(false)} />
+        </div>
+      )}
+   </>
   );
 }

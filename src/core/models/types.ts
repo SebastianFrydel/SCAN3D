@@ -49,6 +49,8 @@ export interface DetectedObject {
     depth: number;
     height: number;
     quaternion: [number, number, number, number];
+    label?: string;
+    color?: number;
 }
 
 export interface RoomLighting {
